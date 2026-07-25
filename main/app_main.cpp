@@ -218,6 +218,13 @@ void app_main() {
   // Start NTP server (passes GPS reference for lock checking)
   g_ntpServer = new NtpServer();
   g_ntpServer->begin(Config::getNtpServerPort(), g_gps);
+  if (g_ethernet) {
+    // A W5500 register loss closes the NTP socket along with everything else;
+    // reopen it whenever the ethernet layer rebuilds the chip.
+    g_ethernet->onChipReset([](void*) {
+      if (g_ntpServer) g_ntpServer->reopenSocket();
+    }, nullptr);
+  }
 
   g_ntpStats = new NtpStats();
   g_ntpStats->begin(8080, g_gps, g_ntpServer, g_ethernet, g_wifi);

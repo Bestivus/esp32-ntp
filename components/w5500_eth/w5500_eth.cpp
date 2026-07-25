@@ -101,7 +101,9 @@ static void wizchip_writeburst(uint8_t* pBuf, uint16_t len) {
 }
 
 W5500Eth::W5500Eth()
-  : eth_netif(nullptr), linkUp(false), useDhcp(false), intPin(-1), rstPin(-1) {
+  : eth_netif(nullptr), linkUp(false), useDhcp(false), intPin(-1), rstPin(-1),
+    expectedMac{}, haveStatic(false), staticIp4{}, staticGw4{}, staticSn4{},
+    chipResetCount(0), chipResetCb(nullptr), chipResetCbArg(nullptr) {
 }
 
 W5500Eth::~W5500Eth() {
@@ -193,7 +195,8 @@ esp_err_t W5500Eth::begin(spi_host_device_t spiHost, int mosiPin, int misoPin, i
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_STA);
   mac[0] = 0x02;
-  
+  memcpy(expectedMac, mac, 6);
+
   wiz_NetInfo netinfo = {};
   memcpy(netinfo.mac, mac, 6);
   netinfo.dhcp = NETINFO_DHCP;
@@ -238,6 +241,10 @@ esp_err_t W5500Eth::start(bool use_static_ip,
       netinfo.dhcp = NETINFO_STATIC;
       wizchip_setnetinfo(&netinfo);
       wizchip_getnetinfo(&netinfo);
+      haveStatic = true;
+      memcpy(staticIp4, ip, 4);
+      memcpy(staticGw4, gw, 4);
+      memcpy(staticSn4, sn, 4);
       ESP_LOGI(TAG, "Static IP: %d.%d.%d.%d  GW: %d.%d.%d.%d  SN: %d.%d.%d.%d",
                netinfo.ip[0], netinfo.ip[1], netinfo.ip[2], netinfo.ip[3],
                netinfo.gw[0], netinfo.gw[1], netinfo.gw[2], netinfo.gw[3],
@@ -353,6 +360,30 @@ void W5500Eth::loop() {
   bool phyOk  = chipOk && (wizphy_getphylink() == PHY_LINK_ON);
   bool healthy = chipOk && phyOk;
 
+  // A W5500 that spontaneously resets (power glitch) still answers SPI and
+  // reads VERSIONR=4, but its register file is back to defaults — SHAR
+  // included. Left alone, the next DHCP_init() would see SHAR=0 and adopt
+  // ioLibrary's temporary MAC (00:08:dc:00:00:00), so the router hands out a
+  // brand-new lease and the server silently moves to a different IP without
+  // ever rebooting (2026-07-24 outage). Compare SHAR against the MAC we
+  // programmed and rebuild the chip config in place when it's been lost.
+  if (chipOk) {
+    uint8_t shar[6];
+    getSHAR(shar);
+    if (memcmp(shar, expectedMac, 6) != 0) {
+      getSHAR(shar);   // reread — never act on a single glitched SPI transfer
+      if (memcmp(shar, expectedMac, 6) != 0) {
+        ESP_LOGE(TAG, "W5500 register loss (SHAR=%02x:%02x:%02x:%02x:%02x:%02x) — reinitializing chip in place",
+                 shar[0], shar[1], shar[2], shar[3], shar[4], shar[5]);
+        chipResetCount++;
+        reinitChip();
+        linkUp = false;   // PHY renegotiates; the link-up transition below restarts DHCP
+        if (chipResetCb) chipResetCb(chipResetCbArg);
+        return;
+      }
+    }
+  }
+
   if (healthy != linkUp) {
     ESP_LOGI(TAG, "Ethernet link %s (chipOk=%d phyOk=%d)", healthy ? "up" : "down", chipOk, phyOk);
     if (healthy && useDhcp) {
@@ -392,6 +423,38 @@ void W5500Eth::loop() {
     ESP_LOGE(TAG, "W5500 unresponsive >60s — restarting to recover");
     esp_restart();
   }
+}
+
+void W5500Eth::reinitChip() {
+  // Start from clean silicon when the reset line is wired, mirroring begin().
+  if (rstPin >= 0) {
+    gpio_set_level((gpio_num_t)rstPin, 0);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    gpio_set_level((gpio_num_t)rstPin, 1);
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+
+  uint8_t memsize[8] = {2, 2, 2, 2, 2, 2, 2, 2};
+  wizchip_init(memsize, memsize);
+
+  wiz_NetInfo netinfo = {};
+  memcpy(netinfo.mac, expectedMac, 6);
+  if (haveStatic) {
+    memcpy(netinfo.ip, staticIp4, 4);
+    memcpy(netinfo.gw, staticGw4, 4);
+    memcpy(netinfo.sn, staticSn4, 4);
+    netinfo.dhcp = NETINFO_STATIC;
+  } else {
+    netinfo.dhcp = NETINFO_DHCP;
+  }
+  wizchip_setnetinfo(&netinfo);
+
+  wiz_PhyConf phyconf = {};
+  phyconf.by = PHY_CONFBY_SW;
+  phyconf.mode = PHY_MODE_AUTONEGO;
+  phyconf.speed = PHY_SPEED_100;
+  phyconf.duplex = PHY_DUPLEX_FULL;
+  wizphy_setphyconf(&phyconf);
 }
 
 bool W5500Eth::isLinkUp() const {

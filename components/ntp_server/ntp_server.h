@@ -10,6 +10,7 @@ public:
   NtpServer();
   esp_err_t begin(int port, GpsDiscipline* gps);
   void loop();
+  void reopenSocket();   // after a W5500 chip re-init: hardware sockets are gone
   uint32_t getRequestCount() const { return requestCount; }
   uint32_t getRxIrqCount() const;
   double getTxCorrectionUs() const;

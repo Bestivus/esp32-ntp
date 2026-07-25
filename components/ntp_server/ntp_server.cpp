@@ -91,6 +91,22 @@ esp_err_t NtpServer::begin(int port_, GpsDiscipline* gps_) {
   return ESP_OK;
 }
 
+void NtpServer::reopenSocket() {
+  if (useWifi || sock < 0) return;
+  // The W5500's register file was rebuilt after a chip reset, which closed
+  // every hardware socket. Reopen ours and re-arm the chip-side RECV
+  // interrupt enable — the GPIO ISR itself survives.
+  if (w5k_udp_open((uint8_t)sock, (uint16_t)port) != 0) {
+    ESP_LOGE(TAG, "W5500 UDP socket reopen failed (s=%d port=%d)", sock, port);
+    return;
+  }
+  w5k_set_nonblock((uint8_t)sock);
+  if (Config::getW5500IntPin() >= 0) {
+    w5k_enable_rx_irq((uint8_t)sock);
+  }
+  ESP_LOGI(TAG, "NTP W5500 socket reopened (sn=%d port=%d)", sock, port);
+}
+
 uint32_t NtpServer::getRxIrqCount() const { return s_rxIrqCount; }
 double NtpServer::getTxCorrectionUs() const { return s_txCorrectionUs; }
 

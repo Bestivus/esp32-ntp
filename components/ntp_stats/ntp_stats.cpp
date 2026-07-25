@@ -219,8 +219,9 @@ void NtpStats::handleConnection() {
   uint32_t bootCount  = g_bootCount;
   int ethLink         = eth ? (eth->isLinkUp() ? 1 : 0) : -1;
   int w5500Ver        = eth ? (int)eth->readVersion() : -1;
+  uint32_t chipResets = eth ? eth->getChipResetCount() : 0;
 
-  static char resp[3072];
+  static char resp[4096];
   static const int hdrReserve = 128;
   char* body = resp + hdrReserve;
   int blen = snprintf(body, sizeof(resp) - hdrReserve,
@@ -289,7 +290,10 @@ void NtpStats::handleConnection() {
     "ntp_eth_link_up %d\n"
     "# HELP ntp_w5500_version W5500 VERSIONR (4=healthy; other=wedged SPI; -1=n/a)\n"
     "# TYPE ntp_w5500_version gauge\n"
-    "ntp_w5500_version %d\n",
+    "ntp_w5500_version %d\n"
+    "# HELP ntp_w5500_chip_resets_total W5500 register-loss events recovered in place (chip reset without a device reboot)\n"
+    "# TYPE ntp_w5500_chip_resets_total counter\n"
+    "ntp_w5500_chip_resets_total %" PRIu32 "\n",
     gs.lastOffsetSec,
     gs.rmsOffsetSec,
     gs.frequencyPpm,
@@ -311,7 +315,8 @@ void NtpStats::handleConnection() {
     freeHeap,
     minFreeHeap,
     ethLink,
-    w5500Ver
+    w5500Ver,
+    chipResets
   );
 
   if (blen < 0 || blen >= (int)(sizeof(resp) - hdrReserve)) {
