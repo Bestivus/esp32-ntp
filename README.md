@@ -75,6 +75,17 @@ served time as accurate, not merely internally precise.
 Your numbers will depend on antenna placement, GPS module, wiring, and network topology, but the
 takeaway holds: the limit is your GPS and your network path, not the ESP32.
 
+### Still true months later, in an ensemble
+
+A later spot check (2026-08), after months of unattended operation: the same unit now serves as one
+of four independently implemented, hardware-timestamped GPS stratum 1 clocks on a LAN (two NIC-PHC
+clocks disciplined by ts2phc, one BeagleBone PRU clock, and this ESP32). Three separate chrony
+observers each run the full source-selection algorithm across all four. On every observer the ESP32
+is accepted as a truechimer (its error interval overlaps the other three clocks' intervals), sitting
+around -54 us offset with about 31 us of per-sample jitter from the nearest observer. That is the
+same envelope the grandmaster measured at publication, reproduced live by chrony's intersection
+algorithm against three independent clocks rather than by a one-off measurement campaign.
+
 ## Hardware
 
 <p align="center">
