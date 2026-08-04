@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Unlicense
 
 #include "ntp_server.h"
+#include "ntp_prof.h"
 #include "config.h"
 #include "gps.h"
+#include "esp_cpu.h"
 #include <string.h>
 #include <sys/time.h>
 #include "esp_timer.h"
@@ -15,6 +17,62 @@
 #include "freertos/task.h"
 
 static const char* TAG = "NTP_SRV";
+
+/* --- reply-path attribution (see ntp_prof.h) --------------------------- */
+/* Counters published by the SPI shim and the W5500 wrappers. */
+extern "C" {
+extern volatile uint32_t g_w5k_txns, g_w5k_bytes, g_w5k_sels;
+extern volatile uint32_t g_w5k_reap_polls, g_w5k_prime_polls;
+}
+
+/* CPU cycles per microsecond. The NTP task is pinned, so the per-core cycle
+ * counter is a consistent timebase within one loop() call. */
+static const double kCyclesPerUs = (double)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+
+static double   s_profEwma[NTP_PROF_COUNT];
+static uint32_t s_profMax[NTP_PROF_COUNT];
+static uint32_t s_profMin[NTP_PROF_COUNT];
+static bool     s_profSeeded[NTP_PROF_COUNT];
+static uint32_t s_profSamples = 0;
+/* Per-packet SPI accounting, EWMA'd the same way. */
+static double s_profTxns, s_profBytes, s_profSels, s_profReap, s_profPrime;
+
+/* Argument is in CPU cycles; NTP_PROF_ISR_TO_LOOP and _INT_TO_SEND are fed
+ * cycle-equivalents of an esp_timer delta because their two ends are on
+ * different cores (the GPIO ISR runs on core 0, the task on core 1). */
+static inline void prof_add(int i, uint32_t cyc) {
+  if (!s_profSeeded[i]) {
+    s_profEwma[i] = (double)cyc; s_profMin[i] = cyc; s_profSeeded[i] = true;
+  } else {
+    s_profEwma[i] += 0.05 * ((double)cyc - s_profEwma[i]);
+    if (cyc < s_profMin[i]) s_profMin[i] = cyc;
+  }
+  if (cyc > s_profMax[i]) s_profMax[i] = cyc;
+}
+static inline void prof_ewma(double& acc, double v) { acc += 0.05 * (v - acc); }
+
+extern "C" const char* ntp_prof_name(int i) {
+  static const char* const kNames[NTP_PROF_COUNT] = {
+    "isr_to_loop", "rx_ready", "rx_stamp", "recvfrom", "build", "arp_prime",
+    "stage", "t3_calc", "stamp_send", "reap", "post", "int_to_send", "total"
+  };
+  return (i >= 0 && i < NTP_PROF_COUNT) ? kNames[i] : "?";
+}
+extern "C" double ntp_prof_ewma_us(int i) {
+  return (i >= 0 && i < NTP_PROF_COUNT) ? s_profEwma[i] / kCyclesPerUs : 0.0;
+}
+extern "C" double ntp_prof_max_us(int i) {
+  return (i >= 0 && i < NTP_PROF_COUNT) ? (double)s_profMax[i] / kCyclesPerUs : 0.0;
+}
+extern "C" double ntp_prof_min_us(int i) {
+  return (i >= 0 && i < NTP_PROF_COUNT) ? (double)s_profMin[i] / kCyclesPerUs : 0.0;
+}
+extern "C" uint32_t ntp_prof_samples(void) { return s_profSamples; }
+extern "C" double ntp_prof_txns(void)        { return s_profTxns; }
+extern "C" double ntp_prof_bytes(void)       { return s_profBytes; }
+extern "C" double ntp_prof_sels(void)        { return s_profSels; }
+extern "C" double ntp_prof_reap_polls(void)  { return s_profReap; }
+extern "C" double ntp_prof_prime_polls(void) { return s_profPrime; }
 
 // W5500 RX interrupt capture: the INTn pin (active-low) asserts on packet
 // arrival. The GPIO ISR latches a monotonic timestamp at the edge — the same
@@ -249,26 +307,57 @@ void NtpServer::computeNtpTimestamp(uint64_t monoUs, bool locked, uint32_t& sec1
  * long-lived peer in case the chip has aged its entry out, which it gives us no
  * way to query.
  */
+/*
+ * A prime costs an entire extra send-and-wait-for-SENDOK, so it is kept off the
+ * reply path unless the peer is genuinely unknown. Three outcomes:
+ *   PRIME_NOW   - never primed, or the entry is old enough to distrust. Pay for
+ *                 it before stamping t3, exactly as before.
+ *   PRIME_AFTER - the entry is good but ageing. Refresh it AFTER the reply has
+ *                 been sent, where the cost is invisible to the client.
+ *   PRIME_NONE  - fresh; do nothing.
+ * The refresh window is short relative to the hard expiry, so a steady client
+ * keeps the chip's entry warm through background primes and never pays on the
+ * critical path. A send that fails to complete invalidates the entry, so the
+ * next reply goes back to priming first.
+ */
 static uint8_t s_primedIp[4] = {0, 0, 0, 0};
 static uint64_t s_primedUs = 0;
-static const uint64_t kPrimeTtlUs = 10ULL * 1000000ULL;
+static const uint64_t kPrimeRefreshUs = 30ULL * 1000000ULL;
+static const uint64_t kPrimeTtlUs = 300ULL * 1000000ULL;
 
-static bool needsArpPrime(const uint8_t* ip) {
-  uint64_t now = esp_timer_get_time();
+enum PrimeAction { PRIME_NONE, PRIME_AFTER, PRIME_NOW };
+
+static PrimeAction arpPrimeAction(const uint8_t* ip) {
   bool same = (s_primedIp[0] == ip[0] && s_primedIp[1] == ip[1] &&
                s_primedIp[2] == ip[2] && s_primedIp[3] == ip[3]);
-  if (same && s_primedUs && (now - s_primedUs) < kPrimeTtlUs) {
-    s_primeSkips++;
-    return false;
-  }
+  if (!same || s_primedUs == 0) return PRIME_NOW;
+  uint64_t age = esp_timer_get_time() - s_primedUs;
+  if (age >= kPrimeTtlUs) return PRIME_NOW;
+  s_primeSkips++;
+  return (age >= kPrimeRefreshUs) ? PRIME_AFTER : PRIME_NONE;
+}
+
+static void arpPrimeMark(const uint8_t* ip) {
   s_primedIp[0] = ip[0]; s_primedIp[1] = ip[1];
   s_primedIp[2] = ip[2]; s_primedIp[3] = ip[3];
-  s_primedUs = now;
-  return true;
+  s_primedUs = esp_timer_get_time();
 }
 
 void NtpServer::loop() {
   if (sock < 0) return;
+  /* One instruction, taken unconditionally so the arrival probe below is
+   * inside the measured region rather than before it. */
+  const uint32_t cLoop = esp_cpu_get_cycle_count();
+  uint32_t cA = cLoop, cB = cLoop, cC = cLoop, cD = cLoop, cE = cLoop;
+  uint32_t cF = cLoop, cG = cLoop, cH = cLoop, cI = cLoop;
+  /* Snapshot the SPI counters here, so the arrival probe's own transaction is
+   * charged to the packet it detected. */
+  const uint32_t txn0   = g_w5k_txns;
+  const uint32_t byte0  = g_w5k_bytes;
+  const uint32_t sel0   = g_w5k_sels;
+  const uint32_t reap0  = g_w5k_reap_polls;
+  const uint32_t prime0 = g_w5k_prime_polls;
+  uint64_t isrStampUs = 0;
 
   static uint32_t windowSec = 0;
   static int windowCount = 0;
@@ -302,7 +391,9 @@ void NtpServer::loop() {
     // the chip prepends in the RX buffer. Detect arrival with a cheap RSR read
     // and stamp t2 *before* clocking the payload out over SPI, so the SPI read
     // duration no longer inflates the receive timestamp.
-    if (w5k_rx_ready((uint8_t)sock) < 48 + 8) return;
+    const int32_t rsr = w5k_rx_ready((uint8_t)sock);
+    if (rsr < 48 + 8) return;
+    cA = esp_cpu_get_cycle_count();
     // Prefer the hardware-captured arrival edge (INTn ISR). If a fresh IRQ has
     // fired since the last packet we handled, use its latched timestamp — this
     // removes the poll-loop quantization from t2. Otherwise (e.g. a second
@@ -329,9 +420,13 @@ void NtpServer::loop() {
     } else {
       t2_us = esp_timer_get_time();
     }
-    n = w5k_recvfrom((uint8_t)sock, req, sizeof(req), from_ip, &from_port);
+    if (haveIsrStamp) isrStampUs = isrStamp;
+    cB = esp_cpu_get_cycle_count();
+    n = w5k_recvfrom((uint8_t)sock, req, sizeof(req), from_ip, &from_port,
+                     (uint16_t)rsr);
     // Ack the RECV interrupt so INTn de-asserts and the next arrival re-fires.
     w5k_clear_rx_irq((uint8_t)sock);
+    cC = esp_cpu_get_cycle_count();
   }
 
   if (n <= 0) return;
@@ -498,17 +593,27 @@ void NtpServer::loop() {
    * consumed the whole main loop — the same task that runs the PPS discipline.
    * Rate limiting that still does the expensive work is not rate limiting.
    */
+  cD = esp_cpu_get_cycle_count();
+  bool primeAfter = false;
   if (overBudget) {
     /* The W5500 exposes no way to query its ARP cache, so rely on having
      * resolved this peer earlier: a real client that is now over budget was
      * warmed by its own first request, while a spoofed source never was. */
     if (!bucketWarm[b]) return;
-  } else if (needsArpPrime(from_ip) &&
-             w5k_arp_prime((uint8_t)sock, from_ip) != 0) {
-    ESP_LOGW(TAG, "ARP unresolved for %d.%d.%d.%d — dropping reply",
-             from_ip[0], from_ip[1], from_ip[2], from_ip[3]);
-    return;
+  } else {
+    PrimeAction pa = arpPrimeAction(from_ip);
+    if (pa == PRIME_NOW) {
+      if (w5k_arp_prime((uint8_t)sock, from_ip) != 0) {
+        ESP_LOGW(TAG, "ARP unresolved for %d.%d.%d.%d — dropping reply",
+                 from_ip[0], from_ip[1], from_ip[2], from_ip[3]);
+        return;
+      }
+      arpPrimeMark(from_ip);
+    } else if (pa == PRIME_AFTER) {
+      primeAfter = true;
+    }
   }
+  cE = esp_cpu_get_cycle_count();
 
   /*
    * Single-shot send. Two attempts at stamping t3 later than this both failed
@@ -517,10 +622,11 @@ void NtpServer::loop() {
    * staging-then-patching the timestamp in place also stopped the server
    * answering. Until the cause is instrumented properly, correctness wins.
    */
-  uint32_t t3_sec, t3_frac;
-  computeNtpTimestamp(esp_timer_get_time() + (uint64_t)(s_txCorrectionUs + 0.5),
-                      locked, t3_sec, t3_frac);
-  wr_ntp_ts(rsp, 40, t3_sec, t3_frac);
+  /* t3 is left zero in the staged copy on purpose: the late path patches those
+   * eight bytes in the chip's TX buffer just before SEND, and the library
+   * fallback recomputes them into rsp itself. Filling them here only bought a
+   * redundant timestamp conversion on the critical path. */
+  uint32_t t3_sec = 0, t3_frac = 0;
 
   /*
    * Late-stamped send with verification and fallback.
@@ -546,6 +652,7 @@ void NtpServer::loop() {
   int wrDelta = -1;
   int stageRc = w5k_send_stage((uint8_t)sock, rsp, sizeof(rsp), from_ip,
                                from_port, &stampBase, &wrDelta);
+  cF = esp_cpu_get_cycle_count();
   s_lastWrDelta = wrDelta;
   if (stageRc != 0) s_lastStageRc = stageRc;
   if (stageRc == 0) {
@@ -564,20 +671,34 @@ void NtpServer::loop() {
      * pairing an edge to a specific packet needs more than a counter delta.
      * The turnaround is still measured and exported as a diagnostic.
      */
-    computeNtpTimestamp(esp_timer_get_time() + (uint64_t)(s_txCorrectionUs + 0.5),
+    /*
+     * The pre-correction must span from the instant t3 is COMPUTED to the
+     * instant SEND is accepted, not merely the SPI write. Timing only the write
+     * left the intervening work (the sub/serialise, the capture snapshot, the
+     * timer read itself) uncorrected, so t3 was stamped early — which shows up
+     * as an inflated apparent network delay and a negative served offset. Anchor
+     * both the stamp and the measurement on the same instant.
+     */
+    txStart = esp_timer_get_time();
+    computeNtpTimestamp(txStart + (uint64_t)(s_txCorrectionUs + 0.5),
                         locked, t3_sec, t3_frac);
     ntp_ts_sub_us(t3_sec, t3_frac, Config::getServeCalibrationUs());
     wr_ntp_ts(tail, 0, t3_sec, t3_frac);
     uint32_t capBefore = 0, capTmp = 0;
     if (gps) gps->getRxCapture(capTmp, capBefore);
-    txStart = esp_timer_get_time();
+    cG = esp_cpu_get_cycle_count();
     int rc = w5k_send_stamp_and_fire((uint8_t)sock, (uint16_t)(stampBase + 40),
                                      tail, sizeof(tail));
+    cH = esp_cpu_get_cycle_count();
     /* Stop timing HERE: the frame is on the wire once SEND is accepted. The
      * SENDOK reap below happens after egress and must not inflate the t3
      * pre-correction. */
     txEnd = esp_timer_get_time();
     if (rc == 0) rc = w5k_send_reap((uint8_t)sock);
+    cI = esp_cpu_get_cycle_count();
+    /* A send that never completed means the chip could not reach the peer;
+     * distrust the ARP entry so the next reply primes before stamping. */
+    if (rc != 0) s_primedUs = 0;
     /*
      * SENDOK has now fired, so its INTn edge should be latched. Accept the
      * sample only if exactly one new capture appeared (an interleaved arrival
@@ -635,5 +756,53 @@ void NtpServer::loop() {
              from_ip[0], from_ip[1], from_ip[2], from_ip[3], (unsigned)from_port, rsp[1], li);
   } else {
     ESP_LOGW(TAG, "W5500 sendto failed");
+  }
+
+  /* --- attribution roll-up (served packets only) ----------------------- */
+  if (!useWifi && late) {
+    const uint32_t cEnd = esp_cpu_get_cycle_count();
+    prof_add(NTP_PROF_RX_READY,   cA - cLoop);
+    prof_add(NTP_PROF_RX_STAMP,   cB - cA);
+    prof_add(NTP_PROF_RECVFROM,   cC - cB);
+    prof_add(NTP_PROF_BUILD,      cD - cC);
+    prof_add(NTP_PROF_ARP,        cE - cD);
+    prof_add(NTP_PROF_STAGE,      cF - cE);
+    prof_add(NTP_PROF_T3,         cG - cF);
+    prof_add(NTP_PROF_STAMP_SEND, cH - cG);
+    prof_add(NTP_PROF_REAP,       cI - cH);
+    prof_add(NTP_PROF_POST,       cEnd - cI);
+    prof_add(NTP_PROF_TOTAL,      cEnd - cLoop);
+    /* Cross-core ends: convert the esp_timer deltas into cycle-equivalents so
+     * every span reads out through the same divisor. */
+    if (isrStampUs && txEnd > isrStampUs && (txEnd - isrStampUs) < 100000) {
+      prof_add(NTP_PROF_INT_TO_SEND,
+               (uint32_t)((double)(txEnd - isrStampUs) * kCyclesPerUs));
+      /* loop() entry lands (cA-cLoop) cycles before the arrival probe returned,
+       * which is the only point where both timebases are available. */
+      double loopEntryUs = (double)txEnd - (double)(cH - cLoop) / kCyclesPerUs;
+      double d = loopEntryUs - (double)isrStampUs;
+      if (d > 0) prof_add(NTP_PROF_ISR_TO_LOOP, (uint32_t)(d * kCyclesPerUs));
+    }
+    if (s_profSamples == 0) {
+      s_profTxns  = (double)(g_w5k_txns - txn0);
+      s_profBytes = (double)(g_w5k_bytes - byte0);
+      s_profSels  = (double)(g_w5k_sels - sel0);
+      s_profReap  = (double)(g_w5k_reap_polls - reap0);
+      s_profPrime = (double)(g_w5k_prime_polls - prime0);
+    } else {
+      prof_ewma(s_profTxns,  (double)(g_w5k_txns - txn0));
+      prof_ewma(s_profBytes, (double)(g_w5k_bytes - byte0));
+      prof_ewma(s_profSels,  (double)(g_w5k_sels - sel0));
+      prof_ewma(s_profReap,  (double)(g_w5k_reap_polls - reap0));
+      prof_ewma(s_profPrime, (double)(g_w5k_prime_polls - prime0));
+    }
+    s_profSamples++;
+  }
+
+  /* Deliberately last: the reply is already on the wire, so refreshing the
+   * chip's ARP entry here costs this client nothing. */
+  if (primeAfter) {
+    if (w5k_arp_prime((uint8_t)sock, from_ip) == 0) arpPrimeMark(from_ip);
+    else s_primedUs = 0;
   }
 }

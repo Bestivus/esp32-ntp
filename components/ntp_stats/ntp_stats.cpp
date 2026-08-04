@@ -4,6 +4,7 @@
 #include "config.h"
 #include "gps.h"
 #include "ntp_server.h"
+#include "ntp_prof.h"
 #include "w5500_eth.h"
 #include "wifi_sta.h"
 #include <string.h>
@@ -229,7 +230,7 @@ void NtpStats::handleConnection() {
   int w5500Ver        = eth ? (int)eth->readVersion() : -1;
   uint32_t chipResets = eth ? eth->getChipResetCount() : 0;
 
-  static char resp[20480];
+  static char resp[26624];
   static const int hdrReserve = 128;
   char* body = resp + hdrReserve;
   int blen = snprintf(body, sizeof(resp) - hdrReserve,
@@ -440,6 +441,62 @@ void NtpStats::handleConnection() {
     gs.fitValid ? 1 : 0,
     gs.fitSamples,
     gs.fitTicksPerSec);
+
+  /*
+   * Reply-path attribution. Labelled series rather than one metric per span so
+   * a single query renders the whole budget, and so adding a checkpoint does
+   * not change the metric namespace.
+   */
+  if (blen > 0) {
+    int cap = (int)(sizeof(resp) - hdrReserve);
+    blen += snprintf(body + blen, cap - blen,
+      "# HELP ntp_path_span_us Honest software-timed reply-path spans (EWMA)\n"
+      "# TYPE ntp_path_span_us gauge\n");
+    for (int i = 0; i < NTP_PROF_COUNT && blen < cap - 128; ++i)
+      blen += snprintf(body + blen, cap - blen,
+        "ntp_path_span_us{span=\"%s\"} %.3f\n",
+        ntp_prof_name(i), ntp_prof_ewma_us(i));
+    blen += snprintf(body + blen, cap - blen,
+      "# HELP ntp_path_span_max_us Worst observed value of each span\n"
+      "# TYPE ntp_path_span_max_us gauge\n");
+    for (int i = 0; i < NTP_PROF_COUNT && blen < cap - 128; ++i)
+      blen += snprintf(body + blen, cap - blen,
+        "ntp_path_span_max_us{span=\"%s\"} %.3f\n",
+        ntp_prof_name(i), ntp_prof_max_us(i));
+    blen += snprintf(body + blen, cap - blen,
+      "# HELP ntp_path_span_min_us Best observed value of each span (the floor)\n"
+      "# TYPE ntp_path_span_min_us gauge\n");
+    for (int i = 0; i < NTP_PROF_COUNT && blen < cap - 128; ++i)
+      blen += snprintf(body + blen, cap - blen,
+        "ntp_path_span_min_us{span=\"%s\"} %.3f\n",
+        ntp_prof_name(i), ntp_prof_min_us(i));
+    blen += snprintf(body + blen, cap - blen,
+      "# HELP ntp_int_to_send_us Arrival edge to SEND accepted (the honest turnaround)\n"
+      "# TYPE ntp_int_to_send_us gauge\n"
+      "ntp_int_to_send_us %.3f\n"
+      "# HELP ntp_path_samples Packets folded into the span EWMAs\n"
+      "# TYPE ntp_path_samples counter\n"
+      "ntp_path_samples %" PRIu32 "\n"
+      "# HELP ntp_spi_txns_per_reply SPI transactions issued per served reply\n"
+      "# TYPE ntp_spi_txns_per_reply gauge\n"
+      "ntp_spi_txns_per_reply %.2f\n"
+      "# HELP ntp_spi_bytes_per_reply Bytes clocked per served reply, headers included\n"
+      "# TYPE ntp_spi_bytes_per_reply gauge\n"
+      "ntp_spi_bytes_per_reply %.2f\n"
+      "# HELP ntp_spi_selects_per_reply wizchip_select() calls per served reply\n"
+      "# TYPE ntp_spi_selects_per_reply gauge\n"
+      "ntp_spi_selects_per_reply %.2f\n"
+      "# HELP ntp_spi_reap_polls_per_reply Sn_IR reads spent spinning on SENDOK\n"
+      "# TYPE ntp_spi_reap_polls_per_reply gauge\n"
+      "ntp_spi_reap_polls_per_reply %.2f\n"
+      "# HELP ntp_spi_prime_polls_per_reply Sn_IR reads spent in w5k_arp_prime\n"
+      "# TYPE ntp_spi_prime_polls_per_reply gauge\n"
+      "ntp_spi_prime_polls_per_reply %.2f\n",
+      ntp_prof_ewma_us(NTP_PROF_INT_TO_SEND),
+      ntp_prof_samples(),
+      ntp_prof_txns(), ntp_prof_bytes(), ntp_prof_sels(),
+      ntp_prof_reap_polls(), ntp_prof_prime_polls());
+  }
 
   /*
    * Per-satellite series, matching ts2phc-go's label scheme so one dashboard

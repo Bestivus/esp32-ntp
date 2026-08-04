@@ -8,7 +8,10 @@ extern "C" {
 
 int w5k_udp_open(uint8_t socket_num, uint16_t port);
 int w5k_close(uint8_t socket_num);
-int32_t w5k_recvfrom(uint8_t socket_num, uint8_t* buf, uint16_t len, uint8_t* from_ip, uint16_t* from_port);
+/* `rsr` is the Sn_RX_RSR value the caller already obtained from
+ * w5k_rx_ready(); passing it in avoids re-reading the register. */
+int32_t w5k_recvfrom(uint8_t socket_num, uint8_t* buf, uint16_t len,
+                     uint8_t* from_ip, uint16_t* from_port, uint16_t rsr);
 int32_t w5k_sendto(uint8_t socket_num, const uint8_t* buf, uint16_t len, const uint8_t* to_ip, uint16_t to_port);
 
 /* Split send, so the transmit timestamp can be written as late as physically

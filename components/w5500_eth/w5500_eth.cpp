@@ -68,11 +68,24 @@ static WORD_ALIGNED_ATTR uint8_t s_frame_tx[W5K_FRAME_MAX + 4];
 static WORD_ALIGNED_ATTR uint8_t s_frame_rx[W5K_FRAME_MAX + 4];
 static uint16_t s_frame_len = 0;    /* bytes accumulated, not yet on the wire */
 
+/*
+ * Attribution counters. Every microsecond in the reply path is either SPI
+ * clocking (bytes / clock rate) or per-call fixed overhead (transactions), so
+ * counting both lets `bytes*t_byte + txns*t_txn` be checked against the
+ * measured span instead of guessed at. Plain increments on a single-owner path.
+ */
+extern "C" {
+volatile uint32_t g_w5k_txns  = 0;   /* spi_device_polling_transmit() calls */
+volatile uint32_t g_w5k_bytes = 0;   /* bytes clocked, header included */
+volatile uint32_t g_w5k_sels  = 0;   /* wizchip_select() calls (bus acquires) */
+}
+
 static void w5k_flush_write(void) {
   if (s_frame_len == 0 || !g_spi_handle) { s_frame_len = 0; return; }
   spi_transaction_t t = {};
   t.length = (size_t)s_frame_len * 8;
   t.tx_buffer = s_frame_tx;
+  g_w5k_txns++; g_w5k_bytes += s_frame_len;
   spi_device_polling_transmit(g_spi_handle, &t);
   s_frame_len = 0;
 }
@@ -96,15 +109,86 @@ static void w5k_flush_read(uint8_t* out, uint16_t len) {
   t.rxlength = (size_t)total * 8;
   t.tx_buffer = s_frame_tx;
   t.rx_buffer = s_frame_rx;
+  g_w5k_txns++; g_w5k_bytes += total;
   spi_device_polling_transmit(g_spi_handle, &t);
   memcpy(out, &s_frame_rx[s_frame_len], len);
   s_frame_len = 0;
 }
 
-static void wizchip_select(void) {
-  if (g_spi_handle) {
-    spi_device_acquire_bus(g_spi_handle, portMAX_DELAY);
+/*
+ * The bus lock is taken ONCE, at init, and never released.
+ *
+ * spi_device_acquire_bus()/release_bus() were being called around every
+ * register access — about 60 times per NTP reply — and each pair costs a few
+ * microseconds of driver bookkeeping (semaphore, device selection, hardware
+ * reconfiguration check), which measured as a double-digit fraction of the
+ * whole reply path. Holding the lock is legal here because the W5500 is the
+ * ONLY device on SPI2_HOST (the display lives on SPI3, see config.cpp) and the
+ * NTP task is its sole owner by design (see the comment in app_main.cpp's
+ * ntp_task explaining why housekeeping shares that task rather than running
+ * concurrently). CS is still toggled per access, so the framing the W5500 sees
+ * is unchanged.
+ */
+static bool s_bus_held = false;
+
+static void w5k_bus_hold(void) {
+  if (g_spi_handle && !s_bus_held &&
+      spi_device_acquire_bus(g_spi_handle, portMAX_DELAY) == ESP_OK) {
+    s_bus_held = true;
   }
+}
+
+/*
+ * Bespoke single-transaction accessors for the NTP reply path (see
+ * w5500_fast.h). Separate buffers from the shim's, so a fast access can never
+ * be issued in the middle of a library frame that is still accumulating.
+ */
+static WORD_ALIGNED_ATTR uint8_t s_fast_tx[3 + 160 + 4];
+static WORD_ALIGNED_ATTR uint8_t s_fast_rx[3 + 160 + 4];
+#define W5K_FAST_MAX 160
+
+extern "C" void w5k_xfer_wr(uint32_t addrsel, const uint8_t* buf, uint16_t len) {
+  if (!g_spi_handle || len == 0 || len > W5K_FAST_MAX) return;
+  s_fast_tx[0] = (uint8_t)((addrsel & 0x00FF0000) >> 16);
+  s_fast_tx[1] = (uint8_t)((addrsel & 0x0000FF00) >> 8);
+  /* Keep the block select (bits 7:3), set RWB=1 (write), OM=00 (VDM). */
+  s_fast_tx[2] = (uint8_t)((addrsel & 0x000000F8) | 0x04);
+  memcpy(&s_fast_tx[3], buf, len);
+  const uint16_t total = (uint16_t)(len + 3);
+  spi_transaction_t t = {};
+  t.length = (size_t)total * 8;
+  t.tx_buffer = s_fast_tx;
+  g_w5k_txns++; g_w5k_bytes += total; g_w5k_sels++;
+  if (g_cs_pin >= 0) gpio_set_level((gpio_num_t)g_cs_pin, 0);
+  spi_device_polling_transmit(g_spi_handle, &t);
+  if (g_cs_pin >= 0) gpio_set_level((gpio_num_t)g_cs_pin, 1);
+}
+
+extern "C" void w5k_xfer_rd(uint32_t addrsel, uint8_t* buf, uint16_t len) {
+  if (!g_spi_handle || len == 0 || len > W5K_FAST_MAX) {
+    if (buf && len) memset(buf, 0, len);
+    return;
+  }
+  s_fast_tx[0] = (uint8_t)((addrsel & 0x00FF0000) >> 16);
+  s_fast_tx[1] = (uint8_t)((addrsel & 0x0000FF00) >> 8);
+  /* RWB=0 (read), OM=00 (VDM). */
+  s_fast_tx[2] = (uint8_t)(addrsel & 0x000000F8);
+  memset(&s_fast_tx[3], 0xFF, len);
+  const uint16_t total = (uint16_t)(len + 3);
+  spi_transaction_t t = {};
+  t.length = (size_t)total * 8;
+  t.rxlength = (size_t)total * 8;
+  t.tx_buffer = s_fast_tx;
+  t.rx_buffer = s_fast_rx;
+  g_w5k_txns++; g_w5k_bytes += total; g_w5k_sels++;
+  if (g_cs_pin >= 0) gpio_set_level((gpio_num_t)g_cs_pin, 0);
+  spi_device_polling_transmit(g_spi_handle, &t);
+  if (g_cs_pin >= 0) gpio_set_level((gpio_num_t)g_cs_pin, 1);
+  memcpy(buf, &s_fast_rx[3], len);
+}
+
+static void wizchip_select(void) {
+  g_w5k_sels++;
   if (g_cs_pin >= 0) {
     gpio_set_level((gpio_num_t)g_cs_pin, 0);
   }
@@ -115,9 +199,6 @@ static void wizchip_deselect(void) {
   w5k_flush_write();                 /* anything still buffered goes now */
   if (g_cs_pin >= 0) {
     gpio_set_level((gpio_num_t)g_cs_pin, 1);
-  }
-  if (g_spi_handle) {
-    spi_device_release_bus(g_spi_handle);
   }
 }
 
@@ -148,6 +229,7 @@ static void wizchip_writeburst(uint8_t* pBuf, uint16_t len) {
       spi_transaction_t t = {};
       t.length = (size_t)len * 8;
       t.tx_buffer = pBuf;
+      g_w5k_txns++; g_w5k_bytes += len;
       if (g_spi_handle) spi_device_polling_transmit(g_spi_handle, &t);
       return;
     }
@@ -228,6 +310,8 @@ esp_err_t W5500Eth::begin(spi_host_device_t spiHost, int mosiPin, int misoPin, i
     return ret;
   }
   
+  w5k_bus_hold();
+
   if (rstPin >= 0) {
     ESP_LOGI(TAG, "Resetting W5500...");
     gpio_set_level((gpio_num_t)rstPin, 0);
@@ -405,6 +489,7 @@ esp_err_t W5500Eth::start(bool use_static_ip,
 
 esp_err_t W5500Eth::stop() {
   if (g_spi_handle) {
+    if (s_bus_held) { spi_device_release_bus(g_spi_handle); s_bus_held = false; }
     spi_bus_remove_device(g_spi_handle);
     g_spi_handle = nullptr;
   }

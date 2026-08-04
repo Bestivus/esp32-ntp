@@ -4,6 +4,57 @@
 #include "esp_timer.h"
 #include "wizchip_conf.h"
 #include "socket.h"
+#include "w5500_fast.h"
+#include <string.h>
+
+/*
+ * ---------------------------------------------------------------------------
+ * Fast reply path.
+ *
+ * Everything below w5k_fast_* bypasses the ioLibrary and talks to the chip
+ * through w5k_xfer_rd/w5k_xfer_wr, which cost exactly one SPI transaction per
+ * access. The library's own path is kept for DHCP, the stats TCP socket, and
+ * socket setup, where latency is irrelevant.
+ *
+ * What the library spends transactions on, and why none of it is needed here:
+ *  - Sn_RX_RSR / Sn_TX_FSR are read in a do{}while(v != v1) loop because the
+ *    library fetches each 16-bit register as two single-byte accesses, which
+ *    can tear. A 2-byte burst inside one transaction is atomic on the wire, so
+ *    one read suffices.
+ *  - recvfrom() drains the 8-byte PACKET-INFO header and the payload in two
+ *    wiz_recv_data() calls, each of which re-reads Sn_RX_RD, rewrites it, issues
+ *    Sn_CR_RECV and polls Sn_CR. Both live in the same contiguous ring, so one
+ *    burst reads the header and payload together and one RECV closes it out.
+ *  - Sn_DIPR (0x0C-0x0F) and Sn_DPORT (0x10-0x11) are contiguous: one 6-byte
+ *    write replaces two accesses.
+ *  - Sn_TX_FSR (0x20), Sn_TX_RD (0x22) and Sn_TX_WR (0x24) are contiguous too:
+ *    one 6-byte read replaces two double-read loops.
+ *  - getSn_TxMAX() is a constant 2048 for this memsize configuration.
+ *
+ * The W5500 masks a socket buffer pointer to the allocated buffer size and
+ * auto-increments across the wrap in VDM, which is exactly what the library
+ * relies on, so a burst that crosses the ring boundary needs no splitting here
+ * either.
+ * ---------------------------------------------------------------------------
+ */
+#define SN_SREG(sn, off)  (((uint32_t)(off) << 8) + ((uint32_t)(1u + 4u * (sn)) << 3))
+#define SN_TXBUF(sn, off) (((uint32_t)(off) << 8) + ((uint32_t)(2u + 4u * (sn)) << 3))
+#define SN_RXBUF(sn, off) (((uint32_t)(off) << 8) + ((uint32_t)(3u + 4u * (sn)) << 3))
+
+#define OFF_SN_CR      0x0001
+#define OFF_SN_IR      0x0002
+#define OFF_SN_DIPR    0x000C   /* 0x0C..0x0F IP, 0x10..0x11 port: contiguous */
+#define OFF_SN_TX_FSR  0x0020   /* 0x20 FSR, 0x22 RD, 0x24 WR: contiguous     */
+#define OFF_SN_TX_WR   0x0024
+#define OFF_SN_RX_RSR  0x0026
+#define OFF_SN_RX_RD   0x0028
+
+/* memsize is {2,...} KB for every socket (see W5500Eth::begin). */
+#define SN_TX_MAX 2048
+
+/* Attribution counters: how many register reads each spin actually costs. */
+volatile uint32_t g_w5k_reap_polls  = 0;
+volatile uint32_t g_w5k_prime_polls = 0;
 
 int w5k_udp_open(uint8_t socket_num, uint16_t port) {
   return socket(socket_num, Sn_MR_UDP, port, 0) == socket_num ? 0 : -1;
@@ -13,8 +64,53 @@ int w5k_close(uint8_t socket_num) {
   return close(socket_num);
 }
 
-int32_t w5k_recvfrom(uint8_t socket_num, uint8_t* buf, uint16_t len, uint8_t* from_ip, uint16_t* from_port) {
-  return recvfrom(socket_num, buf, len, from_ip, from_port);
+/*
+ * Drain one datagram in six transactions: Sn_RX_RD, one burst covering the
+ * PACKET-INFO header and the payload together, the Sn_RX_RD advance, Sn_CR_RECV
+ * and one Sn_CR acceptance poll. `rsr` is the byte count the caller already read
+ * with w5k_rx_ready(), passed in rather than re-read.
+ */
+int32_t w5k_recvfrom(uint8_t socket_num, uint8_t* buf, uint16_t len,
+                     uint8_t* from_ip, uint16_t* from_port, uint16_t rsr) {
+  uint8_t frame[8 + 128];
+  if (rsr < 8) return 0;
+
+  uint8_t rdb[2];
+  w5k_xfer_rd(SN_SREG(socket_num, OFF_SN_RX_RD), rdb, 2);
+  uint16_t rd = (uint16_t)(((uint16_t)rdb[0] << 8) | rdb[1]);
+
+  uint16_t want = rsr;
+  if (len > 128) len = 128;
+  if (want > (uint16_t)(8 + len)) want = (uint16_t)(8 + len);
+  w5k_xfer_rd(SN_RXBUF(socket_num, rd), frame, want);
+
+  uint16_t plen  = (uint16_t)(((uint16_t)frame[6] << 8) | frame[7]);
+  uint16_t avail = (uint16_t)(want - 8);
+  uint16_t copy  = plen < avail ? plen : avail;
+  if (from_ip)   memcpy(from_ip, frame, 4);
+  if (from_port) *from_port = (uint16_t)(((uint16_t)frame[4] << 8) | frame[5]);
+  if (copy)      memcpy(buf, &frame[8], copy);
+
+  /* Advance past the WHOLE datagram even when it did not fit the caller's
+   * buffer, so the next read still lands on a PACKET-INFO header. A header
+   * claiming more than the socket holds can only be corruption; resynchronise
+   * on Sn_RX_RSR rather than desynchronising the ring. */
+  uint16_t consumed = (uint16_t)(8 + plen);
+  if (consumed > rsr) consumed = rsr;
+  rd = (uint16_t)(rd + consumed);
+  uint8_t wrb[2] = { (uint8_t)(rd >> 8), (uint8_t)rd };
+  w5k_xfer_wr(SN_SREG(socket_num, OFF_SN_RX_RD), wrb, 2);
+
+  uint8_t cmd = Sn_CR_RECV;
+  w5k_xfer_wr(SN_SREG(socket_num, OFF_SN_CR), &cmd, 1);
+  /* Sn_CR self-clears when the command is accepted. Wait for that, because a
+   * later Sn_CR write (the SEND below) would otherwise be dropped. */
+  for (int i = 0; i < 200; i++) {
+    uint8_t cr = 0;
+    w5k_xfer_rd(SN_SREG(socket_num, OFF_SN_CR), &cr, 1);
+    if (cr == 0) break;
+  }
+  return (int32_t)copy;
 }
 
 int32_t w5k_sendto(uint8_t socket_num, const uint8_t* buf, uint16_t len, const uint8_t* to_ip, uint16_t to_port) {
@@ -27,7 +123,11 @@ int w5k_set_nonblock(uint8_t socket_num) {
 }
 
 int32_t w5k_rx_ready(uint8_t socket_num) {
-  return getSn_RX_RSR(socket_num);
+  /* One 2-byte burst: atomic on the wire, so the library's do{}while(v != v1)
+   * double read (four single-byte accesses) is unnecessary. */
+  uint8_t b[2];
+  w5k_xfer_rd(SN_SREG(socket_num, OFF_SN_RX_RSR), b, 2);
+  return (int32_t)(uint16_t)(((uint16_t)b[0] << 8) | b[1]);
 }
 
 void w5k_enable_rx_irq(uint8_t socket_num) {
@@ -55,7 +155,8 @@ void w5k_enable_sendok_irq(uint8_t socket_num) {
 }
 
 void w5k_clear_rx_irq(uint8_t socket_num) {
-  setSn_IR(socket_num, Sn_IR_RECV);
+  uint8_t v = Sn_IR_RECV;
+  w5k_xfer_wr(SN_SREG(socket_num, OFF_SN_IR), &v, 1);
 }
 
 int w5k_sendto_nb(uint8_t socket_num, const uint8_t* buf, uint16_t len, const uint8_t* to_ip, uint16_t to_port) {
@@ -95,28 +196,41 @@ int w5k_send_stage(uint8_t socket_num, const uint8_t* buf, uint16_t len,
                    const uint8_t* to_ip, uint16_t to_port, uint16_t* stamp_off,
                    int* wr_delta) {
   /*
-   * Byte-for-byte the proven w5k_sendto_nb() sequence, stopping short of
-   * Sn_CR_SEND so the caller can patch the transmit timestamp in place first.
-   * Deviating from this sequence (adding an Sn_SR gate and a free-space wait
-   * loop) left wiz_send_data() doing nothing at all — Sn_TX_WR and Sn_TX_FSR
-   * both unchanged — so it is mirrored exactly rather than improved upon.
+   * Same wire sequence as the proven w5k_sendto_nb(), stopping short of
+   * Sn_CR_SEND so the caller can patch the transmit timestamp in place — but in
+   * four transactions instead of a dozen:
+   *   1. Sn_DIPR+Sn_DPORT as one 6-byte write (the registers are contiguous)
+   *   2. Sn_TX_FSR+Sn_TX_RD+Sn_TX_WR as one 6-byte read (likewise contiguous,
+   *      and atomic within one transaction, so no double-read loop is needed)
+   *   3. the frame into the TX ring at Sn_TX_WR
+   *   4. the Sn_TX_WR advance
+   * getSn_TxMAX() is gone: memsize is 2 KB per socket and never changes.
+   *
+   * Sn_TX_WR is written here rather than read back afterwards. Reading it back
+   * immediately returns a stale value on this chip, and an earlier verification
+   * gate built on that read broke the send path outright, so wr_delta is left
+   * unreported.
    */
-  setSn_DIPR(socket_num, (uint8_t*)to_ip);
-  setSn_DPORT(socket_num, to_port);
-  uint16_t maxsz = getSn_TxMAX(socket_num);
-  if (len > maxsz) len = maxsz;
-  if (getSn_TX_FSR(socket_num) < len) return -1;
-  uint16_t wr0 = getSn_TX_WR(socket_num);
+  if (len > SN_TX_MAX) len = SN_TX_MAX;
+
+  uint8_t dst[6];
+  dst[0] = to_ip[0]; dst[1] = to_ip[1]; dst[2] = to_ip[2]; dst[3] = to_ip[3];
+  dst[4] = (uint8_t)(to_port >> 8); dst[5] = (uint8_t)to_port;
+  w5k_xfer_wr(SN_SREG(socket_num, OFF_SN_DIPR), dst, 6);
+
+  uint8_t p[6];
+  w5k_xfer_rd(SN_SREG(socket_num, OFF_SN_TX_FSR), p, 6);
+  uint16_t fsr = (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+  uint16_t wr0 = (uint16_t)(((uint16_t)p[4] << 8) | p[5]);
+  if (fsr < len) return -1;
+
+  w5k_xfer_wr(SN_TXBUF(socket_num, wr0), buf, len);
+  uint16_t nwr = (uint16_t)(wr0 + len);
+  uint8_t wrb[2] = { (uint8_t)(nwr >> 8), (uint8_t)nwr };
+  w5k_xfer_wr(SN_SREG(socket_num, OFF_SN_TX_WR), wrb, 2);
+
   if (stamp_off) *stamp_off = wr0;
-  wiz_send_data(socket_num, (uint8_t*)buf, len);
-  /*
-   * Deliberately do NOT verify by reading Sn_TX_WR back. That read returns a
-   * stale value here (it reports no advance even when the write succeeded), and
-   * gating on it is what made earlier attempts refuse to send at all. The
-   * library never reads it back either — it trusts wiz_send_data and uses the
-   * pointer sampled BEFORE the write, which is exactly what stamp_off carries.
-   */
-  if (wr_delta) *wr_delta = (int)(uint16_t)(getSn_TX_WR(socket_num) - wr0);
+  if (wr_delta) *wr_delta = -1;   /* not read back: see above */
   return 0;
 }
 
@@ -129,12 +243,21 @@ int w5k_send_stage(uint8_t socket_num, const uint8_t* buf, uint16_t len,
  * served timestamp into the future (measured +43 us against a same-switch
  * GPS reference before this split).
  */
+/*
+ * Patch the transmit timestamp in place, then fire.
+ *
+ * EXACTLY two transactions, back to back, with nothing between them: the 8-byte
+ * write into the TX ring, then the Sn_CR_SEND byte. This is the whole point of
+ * the split — it is the window between t3 being computed and the frame leaving,
+ * and it must not grow. The Sn_CR acceptance poll the library does after SEND is
+ * deliberately omitted: it only confirms the chip took the command, and the next
+ * Sn_CR write is the following packet's RECV, milliseconds away.
+ */
 int w5k_send_stamp_and_fire(uint8_t socket_num, uint16_t off,
                             const uint8_t* stamp, uint16_t len) {
-  uint32_t addrsel = ((uint32_t)off << 8) + (WIZCHIP_TXBUF_BLOCK(socket_num) << 3);
-  WIZCHIP_WRITE_BUF(addrsel, (uint8_t*)stamp, len);
-  setSn_CR(socket_num, Sn_CR_SEND);
-  while (getSn_CR(socket_num));
+  w5k_xfer_wr(SN_TXBUF(socket_num, off), stamp, len);
+  uint8_t cmd = Sn_CR_SEND;
+  w5k_xfer_wr(SN_SREG(socket_num, OFF_SN_CR), &cmd, 1);
   return 0;
 }
 
@@ -144,9 +267,19 @@ int w5k_send_reap(uint8_t socket_num) {
    * of spinning. Bound it in time instead. */
   int64_t deadline = esp_timer_get_time() + 2000;
   while (esp_timer_get_time() < deadline) {
-    uint8_t ir = getSn_IR(socket_num);
-    if (ir & Sn_IR_SENDOK) { setSn_IR(socket_num, Sn_IR_SENDOK); return 0; }
-    if (ir & Sn_IR_TIMEOUT) { setSn_IR(socket_num, Sn_IR_TIMEOUT); return -1; }
+    uint8_t ir = 0;
+    g_w5k_reap_polls++;
+    w5k_xfer_rd(SN_SREG(socket_num, OFF_SN_IR), &ir, 1);
+    if (ir & Sn_IR_SENDOK) {
+      uint8_t c = Sn_IR_SENDOK;
+      w5k_xfer_wr(SN_SREG(socket_num, OFF_SN_IR), &c, 1);
+      return 0;
+    }
+    if (ir & Sn_IR_TIMEOUT) {
+      uint8_t c = Sn_IR_TIMEOUT;
+      w5k_xfer_wr(SN_SREG(socket_num, OFF_SN_IR), &c, 1);
+      return -1;
+    }
   }
   return -1;
 }
@@ -191,6 +324,7 @@ int w5k_arp_prime(uint8_t socket_num, const uint8_t* ip) {
 
   int ret = -1;
   for (int i = 0; i < 20000; i++) {     /* backstop; TIMEOUT IR fires first */
+    g_w5k_prime_polls++;
     uint8_t ir = getSn_IR(socket_num);
     if (ir & Sn_IR_SENDOK) {
       setSn_IR(socket_num, Sn_IR_SENDOK);
