@@ -9,6 +9,8 @@
 #include "esp_timer.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "hal/spi_ll.h"
+#include "soc/gpio_struct.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -143,9 +145,104 @@ static void w5k_bus_hold(void) {
  * w5500_fast.h). Separate buffers from the shim's, so a fast access can never
  * be issued in the middle of a library frame that is still accumulating.
  */
-static WORD_ALIGNED_ATTR uint8_t s_fast_tx[3 + 160 + 4];
-static WORD_ALIGNED_ATTR uint8_t s_fast_rx[3 + 160 + 4];
-#define W5K_FAST_MAX 160
+static WORD_ALIGNED_ATTR uint8_t s_fast_tx[3 + 64 + 4];
+static WORD_ALIGNED_ATTR uint8_t s_fast_rx[3 + 64 + 4];
+/* The peripheral's own data buffer is 64 bytes and that is the transfer unit
+ * below, so a whole access — 3-byte header plus payload — must fit in it. The
+ * largest real access is the 56-byte RX drain (3 + 8 + 48 = 59). */
+#define W5K_FAST_MAX 61
+
+/*
+ * The reply path drives SPI2 directly instead of going through
+ * spi_device_polling_transmit().
+ *
+ * Measured with the bus pre-acquired and every access already collapsed to one
+ * transaction, a transaction still cost ~17 us of pure overhead against ~0.4
+ * us/byte of clocking — and 25 of them per reply is the entire remaining budget.
+ * None of that overhead is DMA (disabling DMA changed nothing, measurably): it
+ * is the driver re-deriving per-transaction state that never varies here. Every
+ * call re-runs line-mode, dummy-bit, MISO-delay, command/address-length and
+ * keep-CS configuration, rebuilds DMA descriptors and resets the DMA channel,
+ * then memcpy's a config struct — for a transfer whose only variables are the
+ * bit length and the bytes.
+ *
+ * So: let the driver configure the peripheral once (it already does, during
+ * wizchip_init), then for the hot path write the length, load the peripheral's
+ * data buffer, and start. Everything else is left exactly as the driver set it,
+ * which is why the library path can keep using the driver on the same device.
+ *
+ * Safe here because the NTP task owns this bus by design (see ntp_task in
+ * app_main.cpp) and because spi_device_acquire_bus(), which is held for the
+ * lifetime of the device, disables the driver's interrupt — so no driver
+ * transaction can be in flight underneath us. The DMA links are explicitly
+ * stopped and the DMA FIFOs reset before each transfer, so a preceding
+ * driver-issued DMA transaction cannot leave the peripheral sourcing data from
+ * anywhere but the buffer we just filled.
+ */
+/*
+ * Set to 0 to route the reply path back through spi_device_polling_transmit()
+ * without touching anything else — the escape hatch if a future IDF changes what
+ * the driver leaves configured in the peripheral.
+ *
+ * Measured cost of turning it off, everything else held fixed (60-sample runs
+ * from a GPS-locked reference, medians): served t3-t2 279 -> 300 us, and the SPI
+ * spans rx_ready 9.3 -> 17.2, recvfrom 76.8 -> 102.5, stage 54.8 -> 74.4,
+ * stamp_send 16.5 -> 27.2 us. The ~20 us end-to-end is the smaller half of why
+ * this is kept: stamp_send IS the window between t3 being written and the frame
+ * being handed to the wire, and 16 us instead of 27 us is an accuracy win as
+ * much as a latency one.
+ */
+#define W5K_DIRECT_SPI 1
+
+static spi_dev_t* s_hw = nullptr;
+static uint32_t s_cs_mask = 0;      /* nonzero only for a CS pin below 32 */
+
+static inline void IRAM_ATTR w5k_cs_low(void) {
+  if (s_cs_mask) GPIO.out_w1tc = s_cs_mask;
+  else if (g_cs_pin >= 0) gpio_set_level((gpio_num_t)g_cs_pin, 0);
+}
+static inline void IRAM_ATTR w5k_cs_high(void) {
+  if (s_cs_mask) GPIO.out_w1ts = s_cs_mask;
+  else if (g_cs_pin >= 0) gpio_set_level((gpio_num_t)g_cs_pin, 1);
+}
+
+/* Clock `total` bytes out of s_fast_tx; if `want_rx`, capture them into
+ * s_fast_rx. Full duplex, which is what the shim already relies on. */
+static void w5k_fifo_xfer(uint16_t total, bool want_rx) {
+  const size_t bits = (size_t)total * 8;
+  g_w5k_txns++; g_w5k_bytes += total; g_w5k_sels++;
+
+#if !W5K_DIRECT_SPI
+  spi_transaction_t t = {};
+  t.length = bits;
+  t.tx_buffer = s_fast_tx;
+  if (want_rx) { t.rxlength = bits; t.rx_buffer = s_fast_rx; }
+  spi_device_polling_transmit(g_spi_handle, &t);
+  return;
+#else
+  spi_dev_t* hw = s_hw;
+
+  /* Make sure nothing is still driving the peripheral from DMA. */
+  hw->dma_out_link.start = 0;
+  hw->dma_in_link.start = 0;
+  hw->dma_conf.val |= SPI_LL_DMA_FIFO_RST_MASK;
+  hw->dma_conf.val &= ~SPI_LL_DMA_FIFO_RST_MASK;
+
+  hw->user.usr_mosi_highpart = 0;
+  hw->user.usr_miso_highpart = 0;
+  spi_ll_enable_mosi(hw, 1);
+  spi_ll_enable_miso(hw, want_rx ? 1 : 0);
+  spi_ll_set_mosi_bitlen(hw, bits);
+  spi_ll_set_miso_bitlen(hw, bits);
+  spi_ll_write_buffer(hw, s_fast_tx, bits);
+
+  spi_ll_clear_int_stat(hw);
+  spi_ll_user_start(hw);
+  while (!spi_ll_usr_is_done(hw)) { }
+
+  if (want_rx) spi_ll_read_buffer(hw, s_fast_rx, bits);
+#endif
+}
 
 extern "C" void w5k_xfer_wr(uint32_t addrsel, const uint8_t* buf, uint16_t len) {
   if (!g_spi_handle || len == 0 || len > W5K_FAST_MAX) return;
@@ -154,14 +251,9 @@ extern "C" void w5k_xfer_wr(uint32_t addrsel, const uint8_t* buf, uint16_t len) 
   /* Keep the block select (bits 7:3), set RWB=1 (write), OM=00 (VDM). */
   s_fast_tx[2] = (uint8_t)((addrsel & 0x000000F8) | 0x04);
   memcpy(&s_fast_tx[3], buf, len);
-  const uint16_t total = (uint16_t)(len + 3);
-  spi_transaction_t t = {};
-  t.length = (size_t)total * 8;
-  t.tx_buffer = s_fast_tx;
-  g_w5k_txns++; g_w5k_bytes += total; g_w5k_sels++;
-  if (g_cs_pin >= 0) gpio_set_level((gpio_num_t)g_cs_pin, 0);
-  spi_device_polling_transmit(g_spi_handle, &t);
-  if (g_cs_pin >= 0) gpio_set_level((gpio_num_t)g_cs_pin, 1);
+  w5k_cs_low();
+  w5k_fifo_xfer((uint16_t)(len + 3), false);
+  w5k_cs_high();
 }
 
 extern "C" void w5k_xfer_rd(uint32_t addrsel, uint8_t* buf, uint16_t len) {
@@ -174,16 +266,9 @@ extern "C" void w5k_xfer_rd(uint32_t addrsel, uint8_t* buf, uint16_t len) {
   /* RWB=0 (read), OM=00 (VDM). */
   s_fast_tx[2] = (uint8_t)(addrsel & 0x000000F8);
   memset(&s_fast_tx[3], 0xFF, len);
-  const uint16_t total = (uint16_t)(len + 3);
-  spi_transaction_t t = {};
-  t.length = (size_t)total * 8;
-  t.rxlength = (size_t)total * 8;
-  t.tx_buffer = s_fast_tx;
-  t.rx_buffer = s_fast_rx;
-  g_w5k_txns++; g_w5k_bytes += total; g_w5k_sels++;
-  if (g_cs_pin >= 0) gpio_set_level((gpio_num_t)g_cs_pin, 0);
-  spi_device_polling_transmit(g_spi_handle, &t);
-  if (g_cs_pin >= 0) gpio_set_level((gpio_num_t)g_cs_pin, 1);
+  w5k_cs_low();
+  w5k_fifo_xfer((uint16_t)(len + 3), true);
+  w5k_cs_high();
   memcpy(buf, &s_fast_rx[3], len);
 }
 
@@ -274,7 +359,10 @@ esp_err_t W5500Eth::begin(spi_host_device_t spiHost, int mosiPin, int misoPin, i
   io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
   gpio_config(&io_conf);
   gpio_set_level((gpio_num_t)csPin, 1);
-  
+  /* Direct CS toggling on the reply path needs GPIO_OUT, which only covers
+   * pins 0-31; anything higher falls back to gpio_set_level(). */
+  s_cs_mask = (csPin >= 0 && csPin < 32) ? (1u << csPin) : 0u;
+
   if (rstPin >= 0) {
     io_conf.pin_bit_mask = (1ULL << rstPin);
     gpio_config(&io_conf);
@@ -342,6 +430,13 @@ esp_err_t W5500Eth::begin(spi_host_device_t spiHost, int mosiPin, int misoPin, i
     vTaskDelay(pdMS_TO_TICKS(10));
   }
   ESP_LOGI(TAG, "W5500 version: 0x%02x (expected 0x04)", version);
+
+  /* Only now arm the direct-register reply path: wizchip_init() and the version
+   * reads above have gone through the driver, so the peripheral's per-transaction
+   * configuration (line mode, dummy bits, MISO delay, cmd/addr lengths, keep-CS)
+   * is established and the fast path can inherit it. */
+  s_hw = SPI_LL_GET_HW(spiHost);
+  ESP_LOGI(TAG, "W5500 reply path on direct SPI%d FIFO access", (int)spiHost + 1);
   
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_STA);

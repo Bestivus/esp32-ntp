@@ -98,6 +98,12 @@ int getW5500IntPin() { return kW5500IntPin; }
 // corrupt silently, which surfaces as wrong Sn_TX_FSR/Sn_TX_WR values and
 // therefore malformed packets rather than an obvious failure. Do not exceed
 // 26 MHz without moving SPI to the IO_MUX pins.
+// TRIED AND REVERTED: 80 MHz / 3 = 26.67 MHz. The divider is integral, so that
+// is the only step above 20 MHz that exists (anything between rounds back down
+// to 80/4). At 26.67 MHz this board does not come up at all — no NTP, no
+// /metrics, no ICMP — so the ceiling above is optimistic for this wiring rather
+// than merely marginal. It stays at 20 MHz. Byte clocking is only ~100 us of the
+// reply path anyway, so the most this could ever have returned is ~25 us.
 int getW5500SpiHz() { return 20000000; }
 int getW5500RstPin() { return kW5500RstPin; }
 

@@ -74,7 +74,12 @@ int w5k_close(uint8_t socket_num) {
  */
 int32_t w5k_recvfrom(uint8_t socket_num, uint8_t* buf, uint16_t len,
                      uint8_t* from_ip, uint16_t* from_port, uint16_t rsr) {
-  uint8_t frame[8 + 128];
+  /* One access must fit the SPI peripheral's 64-byte data buffer once the
+   * 3-byte W5500 header is included, so the header-plus-payload burst is capped
+   * at 58: the 8-byte PACKET-INFO header plus 50 payload bytes. A 48-byte NTP
+   * request fits with room to spare; anything longer is truncated to 50 bytes
+   * here, which still exceeds everything this server parses (the first 48). */
+  uint8_t frame[58];
   if (rsr < 8) return 0;
 
   uint8_t rdb[2];
@@ -82,7 +87,7 @@ int32_t w5k_recvfrom(uint8_t socket_num, uint8_t* buf, uint16_t len,
   uint16_t rd = (uint16_t)(((uint16_t)rdb[0] << 8) | rdb[1]);
 
   uint16_t want = rsr;
-  if (len > 128) len = 128;
+  if (len > (uint16_t)(sizeof(frame) - 8)) len = (uint16_t)(sizeof(frame) - 8);
   if (want > (uint16_t)(8 + len)) want = (uint16_t)(8 + len);
   w5k_xfer_rd(SN_RXBUF(socket_num, rd), frame, want);
 
