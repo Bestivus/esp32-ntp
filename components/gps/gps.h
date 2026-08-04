@@ -8,6 +8,21 @@
 #include "driver/uart.h"
 #include "driver/mcpwm_cap.h"
 
+/* One tracked satellite, as reported by GSV (signal) and GSA (used in fix).
+ * Mirrors the per-SV series ts2phc-go exports, so the fleet's dashboards can
+ * use one query for every clock. */
+struct GpsSatellite {
+    uint8_t gnss;    // GnssSys below
+    uint8_t svid;    // per-constellation id (GLONASS already de-offset by 64)
+    uint8_t cn0;     // dB-Hz; 0 = visible but not tracked
+    int8_t  elev;    // degrees above horizon
+    uint16_t azim;   // degrees true
+    bool used;       // in the navigation solution
+};
+
+enum GnssSys : uint8_t { GNSS_GPS = 0, GNSS_SBAS, GNSS_GLONASS, GNSS_GALILEO,
+                         GNSS_BEIDOU, GNSS_QZSS, GNSS_COUNT };
+
 struct GpsStats {
     double lastOffsetSec;     // last PPS-vs-system offset before correction
     double rmsOffsetSec;      // exponentially-weighted RMS
@@ -21,6 +36,10 @@ struct GpsStats {
     /* --- Receiver quality, parsed from GGA/GSA/GSV ---------------------
      * Advisory only: none of this feeds the time path. It exists so a
      * degrading sky view is visible before it becomes a clock problem. */
+    uint8_t fixType;          // ts2phc-go convention: 0 none, 2 = 2D, 3 = 3D
+    bool timeValid;           // RMC status 'A' and a fix present
+    double latitudeDeg;       // signed; 0 until first fix
+    double longitudeDeg;
     uint8_t fixQuality;       // GGA: 0 none, 1 GPS, 2 DGPS, 4 RTK fix, 5 RTK float
     uint8_t fixMode;          // GSA: 1 none, 2 = 2D, 3 = 3D
     uint8_t satsUsed;         // GGA: satellites in the position solution
@@ -55,6 +74,8 @@ public:
   double getFrequencyPpm() const { return statFrequencyPpm; }
   uint64_t getLastNmeaUpdateUs() const { return lastNmeaUpdateUs; }
   void getStats(GpsStats& out) const;
+  /* Copy the published satellite table. Returns the count written. */
+  int getSatellites(GpsSatellite* out, int maxOut) const;
   /* NMEA quality sentences. Parsed on the UART task; see GpsStats above. */
   bool parse_gga_line(const char* line, int len);
   bool parse_gsa_line(const char* line, int len);
@@ -136,9 +157,28 @@ private:
   volatile uint8_t qSatsGps = 0, qSatsGlonass = 0, qSatsGalileo = 0, qSatsBeidou = 0;
   volatile uint8_t qSatsTracked = 0, qCn0Max = 0, qCn0Mean = 0;
   volatile float qPdop = 0, qHdop = 0, qVdop = 0, qAltitudeM = 0;
+  volatile uint8_t qFixType = 0;
+  volatile bool qTimeValid = false;
+  volatile double qLatDeg = 0, qLonDeg = 0;
   /* GSV spans several sentences per constellation; accumulate then commit. */
   uint8_t gsvTalker = 0, gsvSeen = 0, gsvTracked = 0, gsvMax = 0;
   uint16_t gsvCn0Sum = 0;
+
+  /*
+   * Satellite table. GSV and GSA arrive as a burst once per NMEA cycle, so
+   * fill a build buffer and commit it to the published copy when RMC opens the
+   * next cycle. Readers therefore always see one whole consistent sweep.
+   */
+  static const int MAX_SATS = 40;
+  GpsSatellite satBuild[MAX_SATS] = {};
+  int satBuildN = 0;
+  GpsSatellite satPub[MAX_SATS] = {};
+  volatile int satPubN = 0;
+  uint8_t usedIds[MAX_SATS] = {};
+  uint8_t usedSys[MAX_SATS] = {};
+  int usedN = 0;
+  void satCommitCycle();
+  void satRecord(uint8_t sys, uint8_t svid, int cn0, int elev, int azim);
 
   void fitPush(uint32_t gpsSec, int64_t tick);
   void fitReset();

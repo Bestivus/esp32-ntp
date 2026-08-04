@@ -363,6 +363,77 @@ static int nmea_i(const char* p) {
   return atoi(p);
 }
 
+
+/* NMEA talker prefix -> constellation. GP GPS, GL GLONASS, GA Galileo,
+ * GB/BD BeiDou, GQ QZSS. GN is the combined talker and carries no system of
+ * its own, so per-SV sentences from it are attributed by SVID range. */
+static uint8_t nmea_sys(char a, char b) {
+  if (a == 'G' && b == 'P') return GNSS_GPS;
+  if (a == 'G' && b == 'L') return GNSS_GLONASS;
+  if (a == 'G' && b == 'A') return GNSS_GALILEO;
+  if ((a == 'G' && b == 'B') || (a == 'B' && b == 'D')) return GNSS_BEIDOU;
+  if (a == 'G' && b == 'Q') return GNSS_QZSS;
+  return GNSS_GPS;
+}
+
+/* Normalise an NMEA SVID to a per-constellation id, and split SBAS out of the
+ * GPS range (33-64 are augmentation satellites, not GPS). */
+static void nmea_svid(uint8_t& sys, int& svid) {
+  if (sys == GNSS_GPS && svid >= 33 && svid <= 64) { sys = GNSS_SBAS; return; }
+  if (sys == GNSS_GLONASS && svid >= 65) { svid -= 64; return; }
+}
+
+/* ddmm.mmmm plus hemisphere -> signed degrees. */
+static double nmea_latlon(const char* v, const char* hemi) {
+  if (!v || *v == ',' || *v == '*' || *v == 0) return 0.0;
+  double raw = atof(v);
+  int deg = (int)(raw / 100.0);
+  double min = raw - deg * 100.0;
+  double d = deg + min / 60.0;
+  if (hemi && (*hemi == 'S' || *hemi == 'W')) d = -d;
+  return d;
+}
+
+void GpsDiscipline::satRecord(uint8_t sys, uint8_t svid, int cn0, int elev, int azim) {
+  for (int i = 0; i < satBuildN; ++i) {
+    if (satBuild[i].gnss == sys && satBuild[i].svid == svid) return;  /* dedupe */
+  }
+  if (satBuildN >= MAX_SATS) return;
+  GpsSatellite& sv = satBuild[satBuildN++];
+  sv.gnss = sys;
+  sv.svid = svid;
+  sv.cn0  = (uint8_t)(cn0 > 0 ? (cn0 > 255 ? 255 : cn0) : 0);
+  sv.elev = (int8_t)(elev < -90 ? -90 : (elev > 90 ? 90 : elev));
+  sv.azim = (uint16_t)(azim < 0 ? 0 : (azim > 359 ? 359 : azim));
+  sv.used = false;
+}
+
+/* Called when RMC opens a new cycle: resolve GSA's used-list against the
+ * satellites GSV reported, publish, and start the next sweep clean. */
+void GpsDiscipline::satCommitCycle() {
+  for (int i = 0; i < satBuildN; ++i) {
+    for (int u = 0; u < usedN; ++u) {
+      if (usedIds[u] == satBuild[i].svid && usedSys[u] == satBuild[i].gnss) {
+        satBuild[i].used = true;
+        break;
+      }
+    }
+  }
+  if (satBuildN > 0) {
+    for (int i = 0; i < satBuildN; ++i) satPub[i] = satBuild[i];
+    satPubN = satBuildN;
+  }
+  satBuildN = 0;
+  usedN = 0;
+}
+
+int GpsDiscipline::getSatellites(GpsSatellite* out, int maxOut) const {
+  int n = satPubN;
+  if (n > maxOut) n = maxOut;
+  for (int i = 0; i < n; ++i) out[i] = satPub[i];
+  return n;
+}
+
 bool GpsDiscipline::parse_gga_line(const char* line, int len) {
   if (len < 6 || line[0] != '$') return false;
   if (strncmp(line+3, "GGA", 3) != 0) return false;
@@ -371,6 +442,8 @@ bool GpsDiscipline::parse_gga_line(const char* line, int len) {
   int nf = nmea_fields(line, len, f, 18);
   if (nf < 10) return false;
   qFixQuality = (uint8_t)nmea_i(f[6]);
+  qLatDeg = nmea_latlon(f[2], f[3]);
+  qLonDeg = nmea_latlon(f[4], f[5]);
   qSatsUsed   = (uint8_t)nmea_i(f[7]);
   qHdop       = nmea_f(f[8]);
   qAltitudeM  = nmea_f(f[9]);
@@ -385,8 +458,21 @@ bool GpsDiscipline::parse_gsa_line(const char* line, int len) {
   int nf = nmea_fields(line, len, f, 22);
   if (nf < 18) return false;
   qFixMode = (uint8_t)nmea_i(f[2]);
+  /* ts2phc-go reports the UBX encoding, where "no fix" is 0 rather than 1. */
+  qFixType = (uint8_t)(qFixMode >= 2 ? qFixMode : 0);
   qPdop    = nmea_f(f[15]);
   qVdop    = nmea_f(f[17]);
+
+  /* Fields 3..14 are the SVIDs used in the solution. u-blox emits one GSA per
+   * constellation, so accumulate across them until RMC ends the cycle. */
+  uint8_t sys = nmea_sys(line[1], line[2]);
+  for (int i = 3; i <= 14 && i < nf; ++i) {
+    int id = nmea_i(f[i]);
+    if (id <= 0) continue;
+    uint8_t sv = sys;
+    nmea_svid(sv, id);
+    if (usedN < MAX_SATS) { usedIds[usedN] = (uint8_t)id; usedSys[usedN] = sv; usedN++; }
+  }
   return true;
 }
 
@@ -410,8 +496,15 @@ bool GpsDiscipline::parse_gsv_line(const char* line, int len) {
   gsvSeen = (uint8_t)inView;
 
   /* Up to four satellites per sentence: id, elev, azim, C/N0. */
+  uint8_t sysBase = nmea_sys(line[1], line[2]);
   for (int i = 4; i + 3 < nf; i += 4) {
     int cn0 = nmea_i(f[i+3]);
+    int id = nmea_i(f[i]);
+    if (id > 0) {
+      uint8_t sv = sysBase;
+      nmea_svid(sv, id);
+      satRecord(sv, (uint8_t)id, cn0, nmea_i(f[i+1]), nmea_i(f[i+2]));
+    }
     if (cn0 > 0) {
       gsvTracked++;
       gsvCn0Sum = (uint16_t)(gsvCn0Sum + cn0);
@@ -448,6 +541,9 @@ void GpsDiscipline::uart_task(void* arg) {
         if (GpsDiscipline::parse_rmc_line(line, pos, unixSec)) {
           self->lastNmeaUnixSec = unixSec;
           self->lastNmeaUpdateUs = esp_timer_get_time();
+          self->qTimeValid = true;
+          /* RMC opens a cycle; GSA/GSV for the previous one are complete. */
+          self->satCommitCycle();
         } else {
           /* Quality sentences. Cheap, and off the time path entirely. */
           self->parse_gga_line(line, pos);
@@ -734,6 +830,10 @@ void GpsDiscipline::getStats(GpsStats& out) const {
   out.nmeaMispairCount = statMispairCount;
   out.holdover = (gpsLock && holdover);
 
+  out.fixType     = qFixType;
+  out.timeValid   = qTimeValid && qFixType >= 2;
+  out.latitudeDeg = qLatDeg;
+  out.longitudeDeg = qLonDeg;
   out.fixQuality  = qFixQuality;
   out.fixMode     = qFixMode;
   out.satsUsed    = qSatsUsed;

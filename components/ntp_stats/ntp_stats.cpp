@@ -227,7 +227,7 @@ void NtpStats::handleConnection() {
   int w5500Ver        = eth ? (int)eth->readVersion() : -1;
   uint32_t chipResets = eth ? eth->getChipResetCount() : 0;
 
-  static char resp[8192];
+  static char resp[20480];
   static const int hdrReserve = 128;
   char* body = resp + hdrReserve;
   int blen = snprintf(body, sizeof(resp) - hdrReserve,
@@ -313,12 +313,12 @@ void NtpStats::handleConnection() {
     "# HELP ntp_gps_fix_quality GGA fix quality (0 none, 1 GPS, 2 DGPS, 4 RTK fix, 5 RTK float)\n"
     "# TYPE ntp_gps_fix_quality gauge\n"
     "ntp_gps_fix_quality %d\n"
-    "# HELP ntp_gps_fix_mode GSA fix mode (1 none, 2 = 2D, 3 = 3D)\n"
-    "# TYPE ntp_gps_fix_mode gauge\n"
-    "ntp_gps_fix_mode %d\n"
-    "# HELP ntp_gps_satellites_used Satellites in the position solution\n"
-    "# TYPE ntp_gps_satellites_used gauge\n"
-    "ntp_gps_satellites_used %d\n"
+    "# HELP gps_fix_type GNSS fix type (0=none,2=2D,3=3D)\n"
+    "# TYPE gps_fix_type gauge\n"
+    "gps_fix_type %d\n"
+    "# HELP gps_satellites_used Satellites in the position solution\n"
+    "# TYPE gps_satellites_used gauge\n"
+    "gps_satellites_used %d\n"
     "# HELP ntp_gps_satellites_visible Satellites in view across all constellations\n"
     "# TYPE ntp_gps_satellites_visible gauge\n"
     "ntp_gps_satellites_visible %d\n"
@@ -337,21 +337,36 @@ void NtpStats::handleConnection() {
     "# HELP ntp_gps_cn0_mean_db Mean C/N0 over tracked satellites, dB-Hz\n"
     "# TYPE ntp_gps_cn0_mean_db gauge\n"
     "ntp_gps_cn0_mean_db %d\n"
-    "# HELP ntp_gps_pdop Position dilution of precision\n"
-    "# TYPE ntp_gps_pdop gauge\n"
-    "ntp_gps_pdop %.2f\n"
-    "# HELP ntp_gps_hdop Horizontal dilution of precision\n"
-    "# TYPE ntp_gps_hdop gauge\n"
-    "ntp_gps_hdop %.2f\n"
-    "# HELP ntp_gps_vdop Vertical dilution of precision\n"
-    "# TYPE ntp_gps_vdop gauge\n"
-    "ntp_gps_vdop %.2f\n"
-    "# HELP ntp_gps_altitude_meters GGA altitude above mean sea level\n"
-    "# TYPE ntp_gps_altitude_meters gauge\n"
-    "ntp_gps_altitude_meters %.1f\n"
+    "# HELP gps_time_valid RMC reports a valid fix\n"
+    "# TYPE gps_time_valid gauge\n"
+    "gps_time_valid %d\n"
+    "# HELP gps_latitude_degrees\n"
+    "# TYPE gps_latitude_degrees gauge\n"
+    "gps_latitude_degrees %.7f\n"
+    "# HELP gps_longitude_degrees\n"
+    "# TYPE gps_longitude_degrees gauge\n"
+    "gps_longitude_degrees %.7f\n"
+    "# HELP gps_pdop Position dilution of precision\n"
+    "# TYPE gps_pdop gauge\n"
+    "gps_pdop %.2f\n"
+    "# HELP gps_hdop Horizontal dilution of precision\n"
+    "# TYPE gps_hdop gauge\n"
+    "gps_hdop %.2f\n"
+    "# HELP gps_vdop Vertical dilution of precision\n"
+    "# TYPE gps_vdop gauge\n"
+    "gps_vdop %.2f\n"
+    "# HELP gps_altitude_msl_meters GGA altitude above mean sea level\n"
+    "# TYPE gps_altitude_msl_meters gauge\n"
+    "gps_altitude_msl_meters %.1f\n"
     "# HELP ntp_gps_nmea_age_seconds Age of the newest valid RMC fix\n"
     "# TYPE ntp_gps_nmea_age_seconds gauge\n"
     "ntp_gps_nmea_age_seconds %.3f\n"
+    "# HELP ts2phc_offset_ns PPS offset against the capture clock, nanoseconds\n"
+    "# TYPE ts2phc_offset_ns gauge\n"
+    "ts2phc_offset_ns{clock=\"mcpwm0\"} %.1f\n"
+    "# HELP ts2phc_freq_ppb Capture-clock frequency error, parts per billion\n"
+    "# TYPE ts2phc_freq_ppb gauge\n"
+    "ts2phc_freq_ppb{clock=\"mcpwm0\"} %.1f\n"
     "# HELP ntp_gps_fit_valid Capture-to-GPS-second least-squares fit is solved\n"
     "# TYPE ntp_gps_fit_valid gauge\n"
     "ntp_gps_fit_valid %d\n"
@@ -392,7 +407,7 @@ void NtpStats::handleConnection() {
     chipResets,
   
     gs.fixQuality,
-    gs.fixMode,
+    gs.fixType,
     gs.satsUsed,
     gs.satsVisible,
     gs.satsGps,
@@ -402,14 +417,69 @@ void NtpStats::handleConnection() {
     gs.satsTracked,
     gs.cn0Max,
     gs.cn0Mean,
+    gs.timeValid ? 1 : 0,
+    gs.latitudeDeg,
+    gs.longitudeDeg,
     gs.pdop,
     gs.hdop,
     gs.vdop,
     gs.altitudeM,
     gs.nmeaAgeMs / 1000.0,
+    gs.lastOffsetSec * 1e9,
+    gs.fitValid ? (gs.fitTicksPerSec / 80000000.0 - 1.0) * 1e9 : 0.0,
     gs.fitValid ? 1 : 0,
     gs.fitSamples,
     gs.fitTicksPerSec);
+
+  /*
+   * Per-satellite series, matching ts2phc-go's label scheme so one dashboard
+   * query covers every clock in the fleet. Appended rather than folded into the
+   * snprintf above because the count varies with the sky.
+   */
+  if (blen > 0) {
+    static const char* const kGnss[GNSS_COUNT] =
+        { "gps", "sbas", "glonass", "galileo", "beidou", "qzss" };
+    GpsSatellite sats[40];
+    int nsat = gps ? gps->getSatellites(sats, 40) : 0;
+    int cap = (int)(sizeof(resp) - hdrReserve);
+    if (nsat > 0 && blen < cap - 1) {
+      blen += snprintf(body + blen, cap - blen,
+        "# HELP gps_satellite_cno_dbhz C/N0 per satellite\n"
+        "# TYPE gps_satellite_cno_dbhz gauge\n");
+      for (int i = 0; i < nsat && blen < cap - 96; ++i)
+        blen += snprintf(body + blen, cap - blen,
+          "gps_satellite_cno_dbhz{gnss=\"%s\",svid=\"%u\"} %u\n",
+          kGnss[sats[i].gnss < GNSS_COUNT ? sats[i].gnss : 0],
+          (unsigned)sats[i].svid, (unsigned)sats[i].cn0);
+
+      blen += snprintf(body + blen, cap - blen,
+        "# HELP gps_satellite_elevation_degrees\n"
+        "# TYPE gps_satellite_elevation_degrees gauge\n");
+      for (int i = 0; i < nsat && blen < cap - 96; ++i)
+        blen += snprintf(body + blen, cap - blen,
+          "gps_satellite_elevation_degrees{gnss=\"%s\",svid=\"%u\"} %d\n",
+          kGnss[sats[i].gnss < GNSS_COUNT ? sats[i].gnss : 0],
+          (unsigned)sats[i].svid, (int)sats[i].elev);
+
+      blen += snprintf(body + blen, cap - blen,
+        "# HELP gps_satellite_azimuth_degrees\n"
+        "# TYPE gps_satellite_azimuth_degrees gauge\n");
+      for (int i = 0; i < nsat && blen < cap - 96; ++i)
+        blen += snprintf(body + blen, cap - blen,
+          "gps_satellite_azimuth_degrees{gnss=\"%s\",svid=\"%u\"} %u\n",
+          kGnss[sats[i].gnss < GNSS_COUNT ? sats[i].gnss : 0],
+          (unsigned)sats[i].svid, (unsigned)sats[i].azim);
+
+      blen += snprintf(body + blen, cap - blen,
+        "# HELP gps_satellite_used 1 if SV used in nav solution\n"
+        "# TYPE gps_satellite_used gauge\n");
+      for (int i = 0; i < nsat && blen < cap - 96; ++i)
+        blen += snprintf(body + blen, cap - blen,
+          "gps_satellite_used{gnss=\"%s\",svid=\"%u\"} %d\n",
+          kGnss[sats[i].gnss < GNSS_COUNT ? sats[i].gnss : 0],
+          (unsigned)sats[i].svid, sats[i].used ? 1 : 0);
+    }
+  }
 
   if (blen < 0 || blen >= (int)(sizeof(resp) - hdrReserve)) {
     blen = (int)(sizeof(resp) - hdrReserve) - 1;
