@@ -40,6 +40,8 @@ int getW5500MosiPin();
 int getW5500MisoPin();
 int getW5500SclkPin();
 int getW5500IntPin();
+int getW5500SpiHz();
+int getServeCalibrationUs();
 int getW5500RstPin();
 
 // WiFi STA (when getNetworkWifi())

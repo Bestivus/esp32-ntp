@@ -19,6 +19,7 @@
 #include "config.h"
 #include "display.h"
 #include "gps.h"
+#include "esp_task_wdt.h"
 #include "ntp_server.h"
 #include "ntp_stats.h"
 #include "w5500_eth.h"
@@ -90,6 +91,65 @@ static void display_task(void* arg) {
   }
 }
 
+/* --- Task layout ------------------------------------------------------ */
+/* Discipline must outrank serving: a packet flood must never delay a pulse. */
+#define PRIO_DISCIPLINE 10
+#define PRIO_NTP         7
+#define CORE_CLOCK       0
+#define CORE_NET         1
+
+static void discipline_task(void* arg) {
+  esp_task_wdt_add(nullptr);
+  for (;;) {
+    g_mainLoopBeats++;              /* liveness, exported over /metrics */
+    if (g_gps) g_gps->loop();
+    esp_task_wdt_reset();
+    /* PPS is 1 Hz; 2 ms keeps handle_pps_deferred() prompt without spinning. */
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+}
+
+static void ntp_task(void* arg) {
+  esp_task_wdt_add(nullptr);
+  unsigned long lastLog = 0;
+  unsigned long lastHouse = 0;
+  for (;;) {
+    /*
+     * Wake on the W5500's INTn interrupt. The timeout is a safety net only:
+     * a second datagram queued behind one INTn assertion produces no new edge,
+     * so a periodic sweep still drains it.
+     */
+    ntp_wait_for_packet(5 /* ms */);
+    if (g_ntpServer) g_ntpServer->loop();
+
+    /*
+     * Housekeeping shares this task deliberately. Every W5500 access funnels
+     * through one coalescing SPI shim with static frame buffers and the WIZnet
+     * library's critical-section hooks are no-ops, so a second task touching
+     * the chip corrupts transfers in flight. Serving from here keeps a single
+     * owner without a mutex the hot path would have to acquire per packet.
+     */
+    /* Time-gated, not sweep-counted: under a burst, packet rate must not drag
+     * housekeeping SPI into the reply path. */
+    unsigned long nowMs = (unsigned long)(esp_timer_get_time() / 1000ULL);
+    if (nowMs - lastHouse >= 20) {
+      lastHouse = nowMs;
+      if (g_ethernet) g_ethernet->loop();
+      if (g_wifi) g_wifi->loop();
+      if (g_ntpStats) g_ntpStats->loop();
+      unsigned long now = esp_timer_get_time() / 1000000ULL;
+      if (now - lastLog >= 60) {
+        struct timeval tv2; struct tm ti2;
+        gettimeofday(&tv2, nullptr);
+        localtime_r(&tv2.tv_sec, &ti2);
+        ESP_LOGI(TAG, "Current time: %02d:%02d:%02d", ti2.tm_hour, ti2.tm_min, ti2.tm_sec);
+        lastLog = now;
+      }
+    }
+    esp_task_wdt_reset();
+  }
+}
+
 void app_main() {
   uart_wait_tx_done(static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM), pdMS_TO_TICKS(100));
   vTaskDelay(pdMS_TO_TICKS(500));
@@ -158,7 +218,7 @@ void app_main() {
       Config::getW5500CsPin(),
       Config::getW5500IntPin(),
       Config::getW5500RstPin(),
-      20000000  // known-good SPI clock for this wiring
+      Config::getW5500SpiHz()  // 20 MHz default; W5500 spec allows far more
     );
     if (err == ESP_OK) {
       ESP_LOGI(TAG, "W5500 initialized, starting Ethernet...");
@@ -216,6 +276,20 @@ void app_main() {
   g_gps->begin(Config::getGpsUartPort(), Config::getGpsUartBaud(), Config::getGpsUartTxPin(), Config::getGpsUartRxPin(), Config::getPpsGpioPin());
 
   // Start NTP server (passes GPS reference for lock checking)
+  // Latch W5500 packet arrival on a second MCPWM capture channel, sharing the
+  // 80 MHz counter that timestamps PPS. Must come after gps->begin() (which
+  // creates the capture timer) and before the server starts using it. Wired
+  // (not wireless) only — lwIP buffers datagrams, so there is no edge to latch.
+  if (!Config::getNetworkWifi() && Config::getW5500IntPin() >= 0) {
+    esp_err_t rxerr = g_gps->beginRxCapture(Config::getW5500IntPin());
+    if (rxerr == ESP_OK)
+      ESP_LOGI(TAG, "RX arrival capture armed on GPIO%d (shared PPS timebase)",
+               Config::getW5500IntPin());
+    else
+      ESP_LOGW(TAG, "RX arrival capture unavailable (%s); t2 falls back to the "
+                    "GPIO ISR stamp", esp_err_to_name(rxerr));
+  }
+
   g_ntpServer = new NtpServer();
   g_ntpServer->begin(Config::getNtpServerPort(), g_gps);
   if (g_ethernet) {
@@ -245,33 +319,26 @@ void app_main() {
   }
 
   ESP_LOGI(TAG, "Entering main loop...");
-  unsigned long lastLog = 0;
-  unsigned int loopCount = 0;
-  bool mainDiag = true;
-  while (true) {
-    g_mainLoopBeats++;   // liveness heartbeat (read over /metrics)
-
-    // Process GPS PPS events with highest priority
-    if (g_gps) g_gps->loop();
-
-    // Process NTP requests (time-critical)
-    if (g_ntpServer) g_ntpServer->loop();
-    
-    if ((loopCount++ % 10) == 0) {
-      if (g_ethernet) g_ethernet->loop();
-      if (g_wifi) g_wifi->loop();
-      if (g_ntpStats) g_ntpStats->loop();
-      if (mainDiag) { mainDiag = false; }
-
-      unsigned long now = esp_timer_get_time() / 1000000ULL;
-      if (now - lastLog >= 60) {
-        gettimeofday(&tv, nullptr);
-        localtime_r(&tv.tv_sec, &timeinfo);
-        ESP_LOGI(TAG, "Current time: %02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-        lastLog = now;
-      }
-    }
-    
-    vTaskDelay(1);
-  }
+  /*
+   * Split the old single poll loop into prioritised tasks.
+   *
+   * The monolithic loop ended in vTaskDelay(1), so a packet waited up to a full
+   * tick before being answered — that random latency was the dominant term in
+   * served jitter, and it also meant an arrival capture could not be reliably
+   * paired with the datagram that produced it. Worse, NTP load and GPS
+   * disciplining shared one thread, so traffic could starve the clock.
+   *
+   * Now: discipline runs at the highest priority on its own core, the NTP
+   * server blocks on a notification from the INTn ISR (so it wakes on arrival
+   * rather than on a timer), and housekeeping runs lowest. Each task registers
+   * with the Task Watchdog, which is already configured to panic — a wedged
+   * discipline task now reboots the box instead of serving a frozen clock.
+   */
+  xTaskCreatePinnedToCore(discipline_task, "discipline", 4096, nullptr,
+                          PRIO_DISCIPLINE, nullptr, CORE_CLOCK);
+  xTaskCreatePinnedToCore(ntp_task, "ntp_srv", 4096, nullptr,
+                          PRIO_NTP, nullptr, CORE_NET);
+  ESP_LOGI(TAG, "tasks started: discipline(prio %d core %d) ntp(prio %d core %d)",
+           PRIO_DISCIPLINE, CORE_CLOCK, PRIO_NTP, CORE_NET);
+  /* app_main returns; the tasks own the system from here. */
 }

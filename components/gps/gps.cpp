@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Unlicense
 
 #include "gps.h"
+#include <stdlib.h>
 #include "config.h"
 #include <string.h>
 #include <stdio.h>
@@ -27,16 +28,19 @@ GpsDiscipline::GpsDiscipline()
     gpsLock(false), holdover(false), lastGoodPpsUs(0), lockExpiredLogged(false),
     statMispairCount(0), mispairStreak(0),
     lastPpsSec1900(0), lastPpsFrac(0), lastPpsMonotonicUs(0),
-    lastNmeaUnixSec(0), lastNmeaUpdateUs(0), ppsPending(false), ppsEdgeUs(0),
-    ppsCapValue(0), prevPpsCapValue(0),
+    lastNmeaUnixSec(0), lastNmeaUpdateUs(0), ppsSeq(0), ppsEdgeUs(0),
+    ppsCapValue(0), ppsSeqSeen(0), prevPpsCapValue(0),
+    fitHead(0), fitCount(0), tickExt(0), tickLastRaw(0), tickInit(false),
+    fitTicksPerSec(80000000.0), fitResidualTicks(0), fitValid(false),
     statLastOffsetSec(0), statRmsOffsetSec(0), statFrequencyPpm(0),
     statPpsJitterSec(0), statPpsCount(0), ppsRejectCount(0), prevPpsMonotonicUs(0),
     ppsIntervalMeanUs(0), ppsJitterVarUs2(0),
-    firstPpsMonotonicUs(0), firstPpsSec(0), clockCorrectionUs(0),
+    clockCorrectionUs(0),
     prevPpsEdgeForOffset(0), lastAppliedTotalCorrUs(0),
-    freqWindowStartUs(0), freqWindowStartSec(0), freqWindowSamples(0),
     filteredFrequencyPpm(0), filteredRmsOffsetSec(0),
-    capTimer(nullptr), capChannel(nullptr) {}
+    capTimer(nullptr), capChannel(nullptr), rxCapChannel(nullptr),
+    rxCapTick(0), rxCapSeq(0),
+    anchorSeq(0), anchorCapTick(0), anchorSec1900(0), anchorFrac(0) {}
 
 esp_err_t GpsDiscipline::begin(int uartPort_, int baud_, int txPin_, int rxPin_, int ppsGpio_) {
   uartPort = uartPort_;
@@ -88,10 +92,175 @@ bool IRAM_ATTR GpsDiscipline::pps_capture_callback(
     const mcpwm_capture_event_data_t* edata,
     void* user_ctx) {
   GpsDiscipline* self = reinterpret_cast<GpsDiscipline*>(user_ctx);
+  // Seqlock publish: bump to odd, write, bump to even. The task retries if
+  // the counter moved or is odd, so it can never consume a torn snapshot.
+  self->ppsSeq = self->ppsSeq + 1;
+  __sync_synchronize();
   self->ppsCapValue = edata->cap_value;
   self->ppsEdgeUs = esp_timer_get_time();
-  self->ppsPending = true;
+  __sync_synchronize();
+  self->ppsSeq = self->ppsSeq + 1;
   return false;  // no high-priority task wakeup needed
+}
+
+// --- Phase/frequency fit ------------------------------------------------
+// wall(tick) is linear in GPS seconds while the oscillator is stable, so a
+// least-squares line through (GPS second, capture tick) gives the frequency
+// as its slope and each pulse's phase error as its residual. Averaging over
+// the window suppresses per-pulse capture noise by ~sqrt(N), and — unlike the
+// old 300-sample hard reset — the frequency estimate is never discarded, so
+// holdover starts from the best estimate available rather than a blind one.
+
+void GpsDiscipline::fitReset() {
+  fitHead = 0;
+  fitCount = 0;
+  fitValid = false;
+  fitTicksPerSec = 80000000.0;
+  fitResidualTicks = 0;
+}
+
+void GpsDiscipline::fitPush(uint32_t gpsSec, int64_t tick) {
+  fitRing[fitHead].sec = gpsSec;
+  fitRing[fitHead].tick = tick;
+  fitHead = (fitHead + 1) % kFitWin;
+  if (fitCount < kFitWin) fitCount++;
+}
+
+bool GpsDiscipline::fitSolve() {
+  if (fitCount < kFitMinSamples) return false;
+  int idx = (fitHead + kFitWin - fitCount) % kFitWin;
+  // Rebase on the oldest sample: doubles hold small deltas exactly, whereas
+  // absolute ticks (2^32+) and GPS seconds (1.7e9) lose sub-tick resolution.
+  const FitSample& base = fitRing[idx];
+  double sx = 0, sy = 0;
+  for (int i = 0; i < fitCount; i++) {
+    const FitSample& s = fitRing[(idx + i) % kFitWin];
+    sx += (double)(int32_t)(s.sec - base.sec);
+    sy += (double)(s.tick - base.tick);
+  }
+  double mx = sx / fitCount, my = sy / fitCount;
+  double sxx = 0, sxy = 0;
+  for (int i = 0; i < fitCount; i++) {
+    const FitSample& s = fitRing[(idx + i) % kFitWin];
+    double dx = (double)(int32_t)(s.sec - base.sec) - mx;
+    double dy = (double)(s.tick - base.tick) - my;
+    sxx += dx * dx;
+    sxy += dx * dy;
+  }
+  if (sxx <= 0) return false;
+  double slope = sxy / sxx;
+  // Sanity: an ESP32 crystal is spec'd ±10 ppm and ages to maybe ±50; a slope
+  // outside ±500 ppm means the ring holds garbage (missed pulses, a step).
+  if (slope < 79960000.0 || slope > 80040000.0) return false;
+  // Residual of the newest sample = its phase error against the model.
+  const FitSample& last = fitRing[(fitHead + kFitWin - 1) % kFitWin];
+  double lx = (double)(int32_t)(last.sec - base.sec) - mx;
+  double ly = (double)(last.tick - base.tick) - my;
+  fitTicksPerSec = slope;
+  fitResidualTicks = ly - slope * lx;
+  return true;
+}
+
+// --- RX packet-arrival capture -----------------------------------------
+// The W5500 asserts INTn when a datagram has landed in its buffer. Feeding
+// that line to a second MCPWM capture channel latches the arrival in the same
+// 80 MHz counter that timestamps PPS: 12.5 ns resolution and, crucially, no
+// interrupt-latency term at all, where the previous GPIO ISR contributed
+// ~1-2 us of jitter to every t2. The ISR here only publishes the already-
+// latched value.
+bool IRAM_ATTR GpsDiscipline::rx_capture_callback(
+    mcpwm_cap_channel_handle_t ch, const mcpwm_capture_event_data_t* edata,
+    void* ctx) {
+  GpsDiscipline* self = reinterpret_cast<GpsDiscipline*>(ctx);
+  // Same odd/even protocol as the PPS callback: writing the tick first and
+  // then bumping a single counter lets a reader pair a NEW tick with an OLD
+  // sequence number, which either drops the capture or misattributes it.
+  self->rxCapSeq = self->rxCapSeq + 1;
+  __sync_synchronize();
+  self->rxCapTick = edata->cap_value;
+  __sync_synchronize();
+  self->rxCapSeq = self->rxCapSeq + 1;
+  return false;
+}
+
+esp_err_t GpsDiscipline::beginRxCapture(int intGpio) {
+  if (intGpio < 0 || capTimer == nullptr) return ESP_ERR_INVALID_ARG;
+  mcpwm_capture_channel_config_t cfg = {};
+  cfg.gpio_num = intGpio;
+  cfg.prescale = 1;
+  cfg.flags.neg_edge = 1;   // INTn is active low
+  cfg.flags.pos_edge = 0;
+  // No pull-up flag: GPIO34-39 have no pull resistors in silicon, so the
+  // W5500 module's external pull-up is what holds INTn high. (The flag was
+  // also removed from mcpwm_capture_channel_config_t in IDF v6.)
+  esp_err_t err = mcpwm_new_capture_channel(capTimer, &cfg, &rxCapChannel);
+  if (err != ESP_OK) return err;
+  mcpwm_capture_event_callbacks_t cbs = {};
+  cbs.on_cap = &GpsDiscipline::rx_capture_callback;
+  err = mcpwm_capture_channel_register_event_callbacks(rxCapChannel, &cbs, this);
+  if (err != ESP_OK) return err;
+  return mcpwm_capture_channel_enable(rxCapChannel);
+}
+
+bool GpsDiscipline::getRxCapture(uint32_t& capTick, uint32_t& seq) const {
+  if (rxCapChannel == nullptr) return false;
+  uint32_t s1, s2;
+  int tries = 0;
+  for (;;) {
+    if (++tries > 8) return false;    // bounded, unlike the original
+    s1 = rxCapSeq;
+    if (s1 & 1) continue;             // ISR mid-publish
+    __sync_synchronize();
+    capTick = rxCapTick;
+    __sync_synchronize();
+    s2 = rxCapSeq;
+    if (s1 == s2) break;
+  }
+  seq = s1;
+  return s1 != 0;
+}
+
+// Capture ticks resolve only +-2^31 ticks (+-26.8 s at 80 MHz) around the
+// anchor, so BOTH the anchor's age and the computed delta must be bounded. Without
+// that, holdover (which keeps isLocked() true for up to an hour while freezing the
+// anchor) silently served receive timestamps wrong by multiples of 53.687 s.
+static const int64_t kMaxAnchorAgeUs = 20000000;   // 20 s
+static const double kMaxCaptureDeltaTicks = 1.6e9; // ~20 s at 80 MHz
+
+bool GpsDiscipline::captureToNtp(uint32_t capTick, uint32_t& sec1900,
+                                 uint32_t& frac) const {
+  if (!fitValid) return false;
+  uint32_t aSeq1, aSeq2, aTick, aSec, aFrac;
+  int64_t aMono;
+  int tries = 0;
+  for (;;) {
+    aSeq1 = anchorSeq;
+    if (!(aSeq1 & 1)) {                 // even => not mid-publish
+      __sync_synchronize();
+      aTick = anchorCapTick; aSec = anchorSec1900; aFrac = anchorFrac;
+      aMono = anchorMonoUs;
+      __sync_synchronize();
+      aSeq2 = anchorSeq;
+      if (aSeq1 == aSeq2) break;
+    }
+    if (++tries > 8) return false;      // bounded, unlike the original
+  }
+  if (aSeq1 == 0) return false;
+  // Reject a stale anchor: in holdover no new anchor is published, and past
+  // ~26.8 s the signed tick delta below wraps and lies by 53.687 s.
+  if (esp_timer_get_time() - aMono > kMaxAnchorAgeUs) return false;
+  // Signed difference handles the 32-bit counter wrap (~53.7 s period), so
+  // any capture within +-26 s of the anchor resolves correctly.
+  double dTicks = (double)(int32_t)(capTick - aTick);
+  if (dTicks > kMaxCaptureDeltaTicks || dTicks < -kMaxCaptureDeltaTicks)
+    return false;                                 // beyond unambiguous range
+  double dSec = dTicks / fitTicksPerSec;          // GPS-rate seconds
+  double frac0 = (double)aFrac / 4294967296.0 + dSec;
+  int32_t whole = (int32_t)floor(frac0);
+  double rem = frac0 - (double)whole;
+  sec1900 = aSec + (uint32_t)whole;
+  frac = (uint32_t)(rem * 4294967296.0);
+  return true;
 }
 
 static bool parse_two(const char* s, int& v) {
@@ -172,6 +341,97 @@ bool GpsDiscipline::parse_rmc_line(const char* line, int len, time_t& outUnixSec
   return true;
 }
 
+
+/* Split an NMEA sentence into field pointers, stopping at the checksum. */
+static int nmea_fields(const char* line, int len, const char** f, int maxf) {
+  int nf = 0;
+  f[nf++] = line;
+  for (int i = 0; i < len && nf < maxf; ++i) {
+    if (line[i] == ',') f[nf++] = &line[i+1];
+    if (line[i] == '*') break;
+  }
+  return nf;
+}
+
+/* atof() on a field that may be empty (",,") — returns 0 rather than garbage. */
+static float nmea_f(const char* p) {
+  if (!p || *p == ',' || *p == '*' || *p == 0) return 0.0f;
+  return (float)atof(p);
+}
+static int nmea_i(const char* p) {
+  if (!p || *p == ',' || *p == '*' || *p == 0) return 0;
+  return atoi(p);
+}
+
+bool GpsDiscipline::parse_gga_line(const char* line, int len) {
+  if (len < 6 || line[0] != '$') return false;
+  if (strncmp(line+3, "GGA", 3) != 0) return false;
+  if (!verify_nmea_checksum(line, len)) return false;
+  const char* f[18];
+  int nf = nmea_fields(line, len, f, 18);
+  if (nf < 10) return false;
+  qFixQuality = (uint8_t)nmea_i(f[6]);
+  qSatsUsed   = (uint8_t)nmea_i(f[7]);
+  qHdop       = nmea_f(f[8]);
+  qAltitudeM  = nmea_f(f[9]);
+  return true;
+}
+
+bool GpsDiscipline::parse_gsa_line(const char* line, int len) {
+  if (len < 6 || line[0] != '$') return false;
+  if (strncmp(line+3, "GSA", 3) != 0) return false;
+  if (!verify_nmea_checksum(line, len)) return false;
+  const char* f[22];
+  int nf = nmea_fields(line, len, f, 22);
+  if (nf < 18) return false;
+  qFixMode = (uint8_t)nmea_i(f[2]);
+  qPdop    = nmea_f(f[15]);
+  qVdop    = nmea_f(f[17]);
+  return true;
+}
+
+bool GpsDiscipline::parse_gsv_line(const char* line, int len) {
+  if (len < 6 || line[0] != '$') return false;
+  if (strncmp(line+3, "GSV", 3) != 0) return false;
+  if (!verify_nmea_checksum(line, len)) return false;
+  const char* f[24];
+  int nf = nmea_fields(line, len, f, 24);
+  if (nf < 4) return false;
+
+  /* Talker tells us the constellation: GP GPS, GL GLONASS, GA Galileo,
+   * GB/BD BeiDou. Each constellation reports its own GSV run. */
+  uint8_t talker = (uint8_t)((line[1] << 4) ^ line[2]);
+  int total = nmea_i(f[1]);
+  int msg   = nmea_i(f[2]);
+  int inView = nmea_i(f[3]);
+  if (msg == 1 || talker != gsvTalker) {
+    gsvTalker = talker; gsvSeen = 0; gsvTracked = 0; gsvMax = 0; gsvCn0Sum = 0;
+  }
+  gsvSeen = (uint8_t)inView;
+
+  /* Up to four satellites per sentence: id, elev, azim, C/N0. */
+  for (int i = 4; i + 3 < nf; i += 4) {
+    int cn0 = nmea_i(f[i+3]);
+    if (cn0 > 0) {
+      gsvTracked++;
+      gsvCn0Sum = (uint16_t)(gsvCn0Sum + cn0);
+      if (cn0 > gsvMax) gsvMax = (uint8_t)cn0;
+    }
+  }
+
+  if (total > 0 && msg >= total) {
+    /* Run complete: publish this constellation's totals. */
+    if (line[1] == 'G' && line[2] == 'L')      qSatsGlonass = gsvSeen;
+    else if (line[1] == 'G' && line[2] == 'A') qSatsGalileo = gsvSeen;
+    else if (line[2] == 'B' || line[1] == 'B') qSatsBeidou  = gsvSeen;
+    else                                        qSatsGps     = gsvSeen;
+    qSatsTracked = gsvTracked;
+    qCn0Max = gsvMax;
+    qCn0Mean = gsvTracked ? (uint8_t)(gsvCn0Sum / gsvTracked) : 0;
+  }
+  return true;
+}
+
 void GpsDiscipline::uart_task(void* arg) {
   auto* self = reinterpret_cast<GpsDiscipline*>(arg);
   const int maxLine = 128;
@@ -184,9 +444,15 @@ void GpsDiscipline::uart_task(void* arg) {
     if (ch == '\n' || ch == '\r') {
       if (pos > 0) {
         time_t unixSec;
+        line[pos] = 0;
         if (GpsDiscipline::parse_rmc_line(line, pos, unixSec)) {
           self->lastNmeaUnixSec = unixSec;
           self->lastNmeaUpdateUs = esp_timer_get_time();
+        } else {
+          /* Quality sentences. Cheap, and off the time path entirely. */
+          self->parse_gga_line(line, pos);
+          self->parse_gsa_line(line, pos);
+          self->parse_gsv_line(line, pos);
         }
       }
       pos = 0;
@@ -205,10 +471,24 @@ bool GpsDiscipline::getLastPps(uint32_t& sec1900, uint32_t& frac) const {
 }
 
 void GpsDiscipline::handle_pps_deferred() {
-  if (!ppsPending) return;
-  ppsPending = false;
-  uint64_t ppsEdgeCapture = ppsEdgeUs;
-  uint32_t capValue = ppsCapValue;
+  // Seqlock consume: retry while the ISR is mid-publish (odd) or republished
+  // under us. Bounded retries so a pathological pulse storm cannot spin here.
+  uint64_t ppsEdgeCapture = 0;
+  uint32_t capValue = 0;
+  uint32_t seq;
+  int tries = 0;
+  for (;;) {
+    if (++tries > 8) return;          // give up; next call retries
+    seq = ppsSeq;
+    if (seq & 1) continue;            // ISR mid-publish
+    if (seq == ppsSeqSeen) return;    // nothing new
+    __sync_synchronize();
+    capValue = ppsCapValue;
+    ppsEdgeCapture = ppsEdgeUs;
+    __sync_synchronize();
+    if (ppsSeq == seq) break;         // snapshot was consistent
+  }
+  ppsSeqSeen = seq;
 
   uint64_t nowUs = esp_timer_get_time();
   uint64_t ageUs = nowUs - lastNmeaUpdateUs;
@@ -244,6 +524,10 @@ void GpsDiscipline::handle_pps_deferred() {
           return;
         }
         ESP_LOGE(TAG, "%+.3fs step persisted %d pulses — accepting as genuine", pairDiff, mispairStreak);
+        // The ring's (second -> tick) pairs straddle the step and would fit a
+        // wildly wrong slope; start the model over from the new timescale.
+        fitReset();
+        tickInit = false;
       }
       mispairStreak = 0;
     }
@@ -261,21 +545,58 @@ void GpsDiscipline::handle_pps_deferred() {
         outlier = true;
         ppsRejectCount++;
         ESP_LOGW(TAG, "PPS outlier rejected: interval=%.0fus (expected ~1000000us)", ppsIntervalUs);
-      } else {
-        offset = (ppsIntervalUs - 1000000.0 + lastAppliedTotalCorrUs) / 1e6;
       }
     }
 
-    // PI servo: only update on clean (non-outlier) pulses
-    double proportionalUs = 0;
-    if (!outlier && statPpsCount >= 20 && prevPpsEdgeForOffset != 0) {
-      statLastOffsetSec = offset;
-      double offsetUs = offset * 1e6;
-      proportionalUs = -0.5 * offsetUs;
-      clockCorrectionUs -= 0.05 * offsetUs;
-      if (clockCorrectionUs > 50)  clockCorrectionUs = 50;
-      if (clockCorrectionUs < -50) clockCorrectionUs = -50;
+    // A gap longer than the counter's unambiguous range makes the tick delta
+    // below alias, so restart the tick timeline and the fit rather than
+    // injecting a sample that is wrong by a multiple of 2^32 ticks.
+    if (prevPpsMonotonicUs != 0 &&
+        (int64_t)(ppsEdgeCapture - prevPpsMonotonicUs) > 20000000LL) {
+      ESP_LOGW(TAG, "PPS gap %.1fs exceeds unambiguous range — restarting fit",
+               (double)(int64_t)(ppsEdgeCapture - prevPpsMonotonicUs) / 1e6);
+      fitReset();
+      tickInit = false;
     }
+
+    // --- Phase/frequency model update ---
+    // Unwrap the 32-bit capture counter (wraps every ~53.7 s at 80 MHz) onto
+    // a monotonic timeline, then refit. The fit's residual for this pulse is
+    // the phase error, measured directly rather than reconstructed from the
+    // previous interval and the correction we happened to apply last time.
+    if (!outlier) {
+      if (!tickInit) {
+        tickInit = true;
+        tickExt = 0;
+        tickLastRaw = capValue;
+      } else {
+        tickExt += (int32_t)(capValue - tickLastRaw);
+        tickLastRaw = capValue;
+      }
+      fitPush((uint32_t)ppsSec, tickExt);
+      fitValid = fitSolve();
+      if (fitValid) {
+        offset = fitResidualTicks / fitTicksPerSec;  // seconds, signed
+        statFrequencyPpm = (fitTicksPerSec / 80000000.0 - 1.0) * 1e6;
+        // The fit IS the smoothed estimate; feed dispersion directly.
+        if (filteredFrequencyPpm == 0 && statPpsCount > kFitMinSamples) {
+          filteredFrequencyPpm = statFrequencyPpm;
+        } else {
+          filteredFrequencyPpm += 0.05 * (statFrequencyPpm - filteredFrequencyPpm);
+        }
+      }
+    }
+
+    // The fit residual is the pulse's deviation from the local oscillator's
+    // own trend line — a measurement-quality figure. It is NOT the system
+    // clock's phase error: settimeofday() cannot move a hardware capture, so
+    // feeding it into a servo was open loop. Worse, a linear fit's endpoint
+    // residual under a frequency ramp is a*T^2/12, so ordinary thermal drift
+    // alone produced a fixed tens-of-microseconds "error" that drove the
+    // integrator into its clamp. Report it; do not act on it. Phase is set
+    // absolutely from ppsSec below on every pulse, which is the real loop.
+    if (!outlier && fitValid) statLastOffsetSec = offset;
+    const double proportionalUs = 0;
 
     // Set system time: elapsed + PI servo + frequency feedforward
     uint64_t setUs = esp_timer_get_time();
@@ -304,6 +625,15 @@ void GpsDiscipline::handle_pps_deferred() {
     // Anchor pair for NTP timestamp extrapolation — must only advance together
     // with lastPpsSec1900/lastPpsFrac (a holdover pulse must not move it).
     lastPpsMonotonicUs = ppsEdgeCapture;
+    // Publish the capture-tick anchor for the shared timebase (seqlock).
+    anchorSeq = anchorSeq + 1;
+    __sync_synchronize();
+    anchorCapTick = capValue;
+    anchorSec1900 = lastPpsSec1900;
+    anchorFrac = lastPpsFrac;
+    anchorMonoUs = (int64_t)ppsEdgeCapture;
+    __sync_synchronize();
+    anchorSeq = anchorSeq + 1;
 
     if (holdover) {
       ESP_LOGI(TAG, "GPS holdover ended after %.0fs — re-disciplined",
@@ -318,8 +648,10 @@ void GpsDiscipline::handle_pps_deferred() {
       ESP_LOGI(TAG, "GPS locked - PPS disciplining active (latency: %" PRId64 "us)", elapsedUs);
     }
 
-    // RMS offset: only include clean samples
-    if (!outlier && prevPpsEdgeForOffset != 0) {
+    // RMS offset: only include clean samples that actually carry a measurement
+    // (offset stays 0 when the fit is invalid, and averaging that in drives the
+    // reported dispersion toward its floor while phase is unmeasured).
+    if (!outlier && fitValid) {
       const double alpha = 0.1;
       statRmsOffsetSec = sqrt(alpha * offset * offset + (1.0 - alpha) * statRmsOffsetSec * statRmsOffsetSec);
       // Separate filtered RMS for dispersion (slower decay, outlier-immune)
@@ -355,44 +687,13 @@ void GpsDiscipline::handle_pps_deferred() {
     prevPpsMonotonicUs = ppsEdgeCapture;
     prevPpsCapValue = capValue;
 
-    // --- Sliding-window frequency estimator ---
-    // Resets every ~300 seconds so stale boot data doesn't dominate.
-    // Only non-outlier pulses advance the window sample count.
-    if (!outlier) {
-      if (freqWindowStartUs == 0) {
-        freqWindowStartUs = ppsEdgeCapture;
-        freqWindowStartSec = (uint32_t)ppsSec;
-        freqWindowSamples = 0;
-      }
-      freqWindowSamples++;
-      if (freqWindowSamples > 300) {
-        // Reset window for fresh estimate
-        freqWindowStartUs = ppsEdgeCapture;
-        freqWindowStartSec = (uint32_t)ppsSec;
-        freqWindowSamples = 0;
-      } else if (freqWindowSamples > 30) {
-        double monoElapsedSec = (double)(ppsEdgeCapture - freqWindowStartUs) / 1e6;
-        double gpsElapsedSec = (double)((uint32_t)ppsSec - freqWindowStartSec);
-        if (gpsElapsedSec > 0) {
-          double rawPpm = ((monoElapsedSec - gpsElapsedSec) / gpsElapsedSec) * 1e6;
-          statFrequencyPpm = rawPpm;  // raw for stats display
-          // EWMA smooth for dispersion / feedforward
-          if (filteredFrequencyPpm == 0 && statPpsCount > 30) {
-            filteredFrequencyPpm = rawPpm;
-          } else {
-            filteredFrequencyPpm += 0.02 * (rawPpm - filteredFrequencyPpm);
-          }
-        }
-      }
-    }
+    // Frequency now comes from the fit above (never reset, so holdover starts
+    // from the best estimate the window holds). The old boot-anchored and
+    // 300-sample-reset estimators are gone.
 
-    // Legacy boot-anchored estimator (kept for stats, replaced by window for servo)
-    if (firstPpsMonotonicUs == 0) {
-      firstPpsMonotonicUs = (int64_t)ppsEdgeCapture;
-      firstPpsSec = (uint32_t)ppsSec;
-    }
-
-    // After warmup, reset accumulators so boot noise doesn't persist
+    // After warmup, reset the noise accumulators so boot transients don't
+    // persist in the reported statistics. The fit ring is deliberately NOT
+    // cleared: its samples are already GPS-referenced and valid.
     static const uint32_t kWarmup = 20;
     if (statPpsCount == kWarmup) {
       statRmsOffsetSec = 0;
@@ -400,15 +701,8 @@ void GpsDiscipline::handle_pps_deferred() {
       ppsIntervalMeanUs = 0;
       ppsJitterVarUs2 = 0;
       prevPpsMonotonicUs = 0;
-      firstPpsMonotonicUs = (int64_t)ppsEdgeCapture;
-      firstPpsSec = (uint32_t)ppsSec;
       statPpsJitterSec = 0;
-      statFrequencyPpm = 0;
-      filteredFrequencyPpm = 0;
       clockCorrectionUs = 0;
-      freqWindowStartUs = ppsEdgeCapture;
-      freqWindowStartSec = (uint32_t)ppsSec;
-      freqWindowSamples = 0;
     }
   } else {
     // PPS with stale/absent NMEA: leave the system clock alone. It is
@@ -421,6 +715,11 @@ void GpsDiscipline::handle_pps_deferred() {
     prevPpsCapValue = 0;
     lastAppliedTotalCorrUs = 0;
     mispairStreak = 0;
+    // Pulses keep arriving with no valid ToD, so the tick timeline keeps
+    // advancing while nothing is pushed to the ring. Restart both so the
+    // first re-disciplined pulse cannot alias across the gap.
+    fitReset();
+    tickInit = false;
     (void)wasLocked;
   }
 }
@@ -434,6 +733,27 @@ void GpsDiscipline::getStats(GpsStats& out) const {
   out.ppsRejectCount = ppsRejectCount;
   out.nmeaMispairCount = statMispairCount;
   out.holdover = (gpsLock && holdover);
+
+  out.fixQuality  = qFixQuality;
+  out.fixMode     = qFixMode;
+  out.satsUsed    = qSatsUsed;
+  out.satsGps     = qSatsGps;
+  out.satsGlonass = qSatsGlonass;
+  out.satsGalileo = qSatsGalileo;
+  out.satsBeidou  = qSatsBeidou;
+  out.satsVisible = (uint8_t)(qSatsGps + qSatsGlonass + qSatsGalileo + qSatsBeidou);
+  out.satsTracked = qSatsTracked;
+  out.cn0Max      = qCn0Max;
+  out.cn0Mean     = qCn0Mean;
+  out.pdop        = qPdop;
+  out.hdop        = qHdop;
+  out.vdop        = qVdop;
+  out.altitudeM   = qAltitudeM;
+  uint64_t nowUs = esp_timer_get_time();
+  out.nmeaAgeMs = lastNmeaUpdateUs ? (uint32_t)((nowUs - lastNmeaUpdateUs) / 1000) : 0;
+  out.fitValid      = fitValid;
+  out.fitSamples    = (uint32_t)fitCount;
+  out.fitTicksPerSec = fitValid ? fitTicksPerSec : 0.0;
 }
 
 double GpsDiscipline::getRootDispersion() const {
@@ -472,6 +792,9 @@ void GpsDiscipline::loop() {
   if (!holdover && sinceGoodUs > kFreshPpsUs) {
     // Covers both stale-NMEA (PPS still pulsing) and PPS-dead outages.
     holdover = true;
+    // The fit's anchor is frozen from here on, so hardware RX timestamping must
+    // stand down; served time falls back to the esp_timer extrapolation path.
+    fitValid = false;
     ESP_LOGW(TAG, "GPS holdover: no discipline for %.1fs — coasting on oscillator (%.3f ppm)",
              (double)sinceGoodUs / 1e6, filteredFrequencyPpm);
   }

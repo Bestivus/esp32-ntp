@@ -17,6 +17,31 @@ struct GpsStats {
     uint32_t ppsRejectCount;  // PPS pulses rejected as outliers
     uint32_t nmeaMispairCount;// PPS pulses skipped as PPS/NMEA second mispairs
     bool holdover;            // coasting on the oscillator (GPS lost, still credible)
+
+    /* --- Receiver quality, parsed from GGA/GSA/GSV ---------------------
+     * Advisory only: none of this feeds the time path. It exists so a
+     * degrading sky view is visible before it becomes a clock problem. */
+    uint8_t fixQuality;       // GGA: 0 none, 1 GPS, 2 DGPS, 4 RTK fix, 5 RTK float
+    uint8_t fixMode;          // GSA: 1 none, 2 = 2D, 3 = 3D
+    uint8_t satsUsed;         // GGA: satellites in the position solution
+    uint8_t satsVisible;      // GSV: satellites in view, all constellations
+    uint8_t satsGps;          // in view, per constellation
+    uint8_t satsGlonass;
+    uint8_t satsGalileo;
+    uint8_t satsBeidou;
+    uint8_t satsTracked;      // satellites reporting a non-zero C/N0
+    uint8_t cn0Max;           // dB-Hz, strongest tracked signal
+    uint8_t cn0Mean;          // dB-Hz, mean over satellites with non-zero C/N0
+    float pdop;               // GSA dilution of precision
+    float hdop;
+    float vdop;
+    float altitudeM;          // GGA altitude, metres above MSL
+    uint32_t nmeaAgeMs;       // age of the newest valid RMC fix
+
+    /* --- Capture fit (the term that actually sets served accuracy) ----- */
+    bool fitValid;
+    uint32_t fitSamples;      // points in the current least-squares window
+    double fitTicksPerSec;    // fitted slope; nominal 80 MHz
 };
 
 class GpsDiscipline {
@@ -30,6 +55,25 @@ public:
   double getFrequencyPpm() const { return statFrequencyPpm; }
   uint64_t getLastNmeaUpdateUs() const { return lastNmeaUpdateUs; }
   void getStats(GpsStats& out) const;
+  /* NMEA quality sentences. Parsed on the UART task; see GpsStats above. */
+  bool parse_gga_line(const char* line, int len);
+  bool parse_gsa_line(const char* line, int len);
+  bool parse_gsv_line(const char* line, int len);
+
+  // --- Shared hardware timebase -----------------------------------------
+  // The MCPWM capture timer that latches PPS also latches the W5500 INTn
+  // (packet-arrival) line on a second channel, so both live on one 80 MHz
+  // counter and the fit converts either to UTC with no esp_timer hop and no
+  // ISR latency in the path.
+  esp_err_t beginRxCapture(int intGpio);
+  // Latest hardware-latched packet arrival; seq lets the caller detect a new
+  // one. Returns false if RX capture is not configured.
+  bool getRxCapture(uint32_t& capTick, uint32_t& seq) const;
+  // Convert a raw capture tick to NTP epoch, via the PPS fit. Ticks are
+  // unwrapped relative to the newest PPS anchor, so the argument must be
+  // within ~±26 s of it. Returns false when the fit is not yet valid.
+  bool captureToNtp(uint32_t capTick, uint32_t& sec1900, uint32_t& frac) const;
+  double getTicksPerSec() const { return fitValid ? fitTicksPerSec : 80000000.0; }
   double getRootDispersion() const;
   double getRootDelay() const;
   void loop();
@@ -54,10 +98,51 @@ private:
   volatile uint64_t lastPpsMonotonicUs;
   volatile time_t lastNmeaUnixSec;
   volatile uint64_t lastNmeaUpdateUs;
-  volatile bool ppsPending;
+  // ISR->task handoff. The ISR publishes a snapshot then bumps ppsSeq; the
+  // task reads ppsSeq, copies, re-reads ppsSeq and retries if it moved
+  // (seqlock). The previous ppsPending flag let the task read a half-updated
+  // snapshot if an edge landed mid-copy — 1 Hz made it improbable, not
+  // impossible, and a torn capture value is a whole-second error.
+  volatile uint32_t ppsSeq;
   volatile uint64_t ppsEdgeUs;
   volatile uint32_t ppsCapValue;
+  uint32_t ppsSeqSeen;
   uint32_t prevPpsCapValue;
+
+  // --- Phase/frequency model -------------------------------------------
+  // The capture timer counts at 80 MHz and wraps every ~53.7 s, so ticks are
+  // unwrapped into a monotonic 64-bit timeline. A least-squares fit of
+  // (GPS second -> capture tick) over the window below yields BOTH the
+  // oscillator frequency (slope) and the phase error of the newest pulse
+  // (its residual), replacing the old scheme where phase was reconstructed
+  // from interval deviation plus the last applied correction — bookkeeping
+  // that biased phase whenever a correction was skipped, and a frequency
+  // estimator that threw away all history every 300 samples.
+  static const int kFitWin = 240;      // ~4 min of 1 Hz pulses
+  static const int kFitMinSamples = 16;
+  struct FitSample { uint32_t sec; int64_t tick; };
+  FitSample fitRing[kFitWin];
+  int fitHead;
+  int fitCount;
+  int64_t tickExt;            // unwrapped capture tick
+  uint32_t tickLastRaw;
+  bool tickInit;
+  double fitTicksPerSec;      // slope: capture ticks per GPS second
+  double fitResidualTicks;    // newest pulse's deviation from the fit
+  bool fitValid;
+
+  /* Receiver-quality state, written by the UART task only. */
+  volatile uint8_t qFixQuality = 0, qFixMode = 0, qSatsUsed = 0;
+  volatile uint8_t qSatsGps = 0, qSatsGlonass = 0, qSatsGalileo = 0, qSatsBeidou = 0;
+  volatile uint8_t qSatsTracked = 0, qCn0Max = 0, qCn0Mean = 0;
+  volatile float qPdop = 0, qHdop = 0, qVdop = 0, qAltitudeM = 0;
+  /* GSV spans several sentences per constellation; accumulate then commit. */
+  uint8_t gsvTalker = 0, gsvSeen = 0, gsvTracked = 0, gsvMax = 0;
+  uint16_t gsvCn0Sum = 0;
+
+  void fitPush(uint32_t gpsSec, int64_t tick);
+  void fitReset();
+  bool fitSolve();
 
   // Statistics tracking
   double statLastOffsetSec;
@@ -69,22 +154,29 @@ private:
   uint64_t prevPpsMonotonicUs;   // previous PPS edge for jitter calc
   double ppsIntervalMeanUs;      // EWMA mean of inter-PPS interval
   double ppsJitterVarUs2;        // EWMA variance of inter-PPS interval (µs²)
-  int64_t firstPpsMonotonicUs;   // first PPS edge for freq estimation
-  uint32_t firstPpsSec;          // first GPS second for freq estimation
   double clockCorrectionUs;      // integral servo correction applied to settimeofday
   uint64_t prevPpsEdgeForOffset;  // previous PPS edge for analytical offset
   double lastAppliedTotalCorrUs;  // total correction applied at previous settimeofday
 
-  // Sliding-window frequency estimation (replaces boot-anchored estimator for dispersion)
-  uint64_t freqWindowStartUs;
-  uint32_t freqWindowStartSec;
-  uint32_t freqWindowSamples;
   double filteredFrequencyPpm;   // EWMA-smoothed frequency for dispersion calc
   double filteredRmsOffsetSec;   // outlier-immune RMS for dispersion calc
 
   // MCPWM capture handles
   mcpwm_cap_timer_handle_t capTimer;
   mcpwm_cap_channel_handle_t capChannel;
+  mcpwm_cap_channel_handle_t rxCapChannel;   // W5500 INTn, packet arrival
+  volatile uint32_t rxCapTick;
+  volatile uint32_t rxCapSeq;
+
+  // Anchor tying the newest disciplined pulse to both timescales, published
+  // together so a reader always gets a consistent pair.
+  volatile uint32_t anchorSeq;
+  volatile uint32_t anchorCapTick;   // raw capture tick of that pulse
+  volatile uint32_t anchorSec1900;   // NTP second it represents
+  volatile uint32_t anchorFrac;      // calibration offset within that second
+  volatile int64_t anchorMonoUs;     // esp_timer at that pulse, for staleness
+
+  static bool IRAM_ATTR rx_capture_callback(mcpwm_cap_channel_handle_t ch, const mcpwm_capture_event_data_t* edata, void* ctx);
 
   static void uart_task(void* arg);
   static bool parse_rmc_line(const char* line, int len, time_t& outUnixSec);

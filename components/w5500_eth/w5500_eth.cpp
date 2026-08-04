@@ -40,6 +40,67 @@ static int g_rst_pin = -1;
 static const uint8_t DHCP_SOCKET_NUM = 0;
 static uint8_t s_dhcp_buf[548];
 
+/*
+ * Coalescing SPI shim.
+ *
+ * A W5500 SPI frame is [addr_hi][addr_lo][control][data...] with
+ * auto-incrementing addresses in VDM (OM=00), so ONE transaction of 3+N bytes
+ * performs an entire access. The ioLibrary, however, emits the three header
+ * bytes through single-byte callbacks, so a plain register read cost four
+ * separate spi_device_polling_transmit() calls — and each call's fixed
+ * overhead dwarfs the ~0.4 us of actual clocking at 20 MHz. That per-call
+ * tax, not SPI bandwidth, is what made a 48-byte UDP send take ~700 us.
+ *
+ * CS is a manual GPIO here (spics_io_num = -1) and is held low across the
+ * whole frame, so bytes can be accumulated between select and deselect and
+ * issued as one transaction. Within a frame the W5500 protocol is either read
+ * or write (the RWB bit says which), never both, so buffering cannot reorder
+ * anything. Reads are full-duplex: the accumulated header is clocked out while
+ * the payload is clocked in.
+ *
+ * Falls back to per-call transactions if a frame ever exceeds the buffer.
+ */
+/* 3-byte header + 2048-byte socket buffer = 2051 max; rounded up and word
+ * aligned because with DMA enabled the driver may write up to 3 bytes past an
+ * unaligned RX length. */
+#define W5K_FRAME_MAX 2064
+static WORD_ALIGNED_ATTR uint8_t s_frame_tx[W5K_FRAME_MAX + 4];
+static WORD_ALIGNED_ATTR uint8_t s_frame_rx[W5K_FRAME_MAX + 4];
+static uint16_t s_frame_len = 0;    /* bytes accumulated, not yet on the wire */
+
+static void w5k_flush_write(void) {
+  if (s_frame_len == 0 || !g_spi_handle) { s_frame_len = 0; return; }
+  spi_transaction_t t = {};
+  t.length = (size_t)s_frame_len * 8;
+  t.tx_buffer = s_frame_tx;
+  spi_device_polling_transmit(g_spi_handle, &t);
+  s_frame_len = 0;
+}
+
+/* Clock out whatever header has accumulated and read len bytes in the same
+ * transaction. */
+static void w5k_flush_read(uint8_t* out, uint16_t len) {
+  if (!g_spi_handle || len == 0) return;
+  uint16_t total = s_frame_len + len;
+  if (total > W5K_FRAME_MAX) {
+    /* Unreachable: the largest real frame is 3 + Sn_TxMAX(2048) = 2051. Fail
+     * loudly rather than hand a caller's unaligned buffer to DMA. */
+    ESP_LOGE(TAG, "W5500 frame %u exceeds buffer — read dropped", total);
+    s_frame_len = 0;
+    memset(out, 0, len);
+    return;
+  }
+  memset(&s_frame_tx[s_frame_len], 0xFF, len);
+  spi_transaction_t t = {};
+  t.length = (size_t)total * 8;
+  t.rxlength = (size_t)total * 8;
+  t.tx_buffer = s_frame_tx;
+  t.rx_buffer = s_frame_rx;
+  spi_device_polling_transmit(g_spi_handle, &t);
+  memcpy(out, &s_frame_rx[s_frame_len], len);
+  s_frame_len = 0;
+}
+
 static void wizchip_select(void) {
   if (g_spi_handle) {
     spi_device_acquire_bus(g_spi_handle, portMAX_DELAY);
@@ -47,9 +108,11 @@ static void wizchip_select(void) {
   if (g_cs_pin >= 0) {
     gpio_set_level((gpio_num_t)g_cs_pin, 0);
   }
+  s_frame_len = 0;
 }
 
 static void wizchip_deselect(void) {
+  w5k_flush_write();                 /* anything still buffered goes now */
   if (g_cs_pin >= 0) {
     gpio_set_level((gpio_num_t)g_cs_pin, 1);
   }
@@ -60,45 +123,49 @@ static void wizchip_deselect(void) {
 
 static uint8_t wizchip_read(void) {
   uint8_t rx_data = 0;
-  if (g_spi_handle) {
-    spi_transaction_t t = {};
-    t.length = 8;
-    t.rxlength = 8;
-    t.flags = SPI_TRANS_USE_RXDATA;
-    spi_device_polling_transmit(g_spi_handle, &t);
-    rx_data = t.rx_data[0];
-  }
+  w5k_flush_read(&rx_data, 1);
   return rx_data;
 }
 
 static void wizchip_write(uint8_t wb) {
-  if (g_spi_handle) {
-    spi_transaction_t t = {};
-    t.length = 8;
-    t.tx_data[0] = wb;
-    t.flags = SPI_TRANS_USE_TXDATA;
-    spi_device_polling_transmit(g_spi_handle, &t);
+  if (s_frame_len < W5K_FRAME_MAX) {
+    s_frame_tx[s_frame_len++] = wb;
+  } else {
+    w5k_flush_write();
+    s_frame_tx[s_frame_len++] = wb;
   }
 }
 
 static void wizchip_readburst(uint8_t* pBuf, uint16_t len) {
-  if (g_spi_handle && pBuf && len > 0) {
-    spi_transaction_t t = {};
-    t.length = len * 8;
-    t.rxlength = len * 8;
-    t.rx_buffer = pBuf;
-    spi_device_polling_transmit(g_spi_handle, &t);
-  }
+  if (pBuf && len > 0) w5k_flush_read(pBuf, len);
 }
 
 static void wizchip_writeburst(uint8_t* pBuf, uint16_t len) {
-  if (g_spi_handle && pBuf && len > 0) {
-    spi_transaction_t t = {};
-    t.length = len * 8;
-    t.tx_buffer = pBuf;
-    spi_device_polling_transmit(g_spi_handle, &t);
+  if (!pBuf || len == 0) return;
+  if (s_frame_len + len > W5K_FRAME_MAX) {
+    w5k_flush_write();
+    if (len > W5K_FRAME_MAX) {          /* oversized: straight to the wire */
+      spi_transaction_t t = {};
+      t.length = (size_t)len * 8;
+      t.tx_buffer = pBuf;
+      if (g_spi_handle) spi_device_polling_transmit(g_spi_handle, &t);
+      return;
+    }
   }
+  memcpy(&s_frame_tx[s_frame_len], pBuf, len);
+  s_frame_len += len;
+  /*
+   * CONTROL TEST / correctness guard: flush this accessor's bytes immediately
+   * rather than accumulating until CS is deselected. CS is a manual GPIO held
+   * low for the whole frame, so per the W5500 datasheet's variable-length data
+   * mode (the data phase is delimited by CS, not by transaction boundaries)
+   * splitting a frame across transactions is legal. Deferring writes until
+   * deselect made a direct wiz_send_data() a no-op — Sn_TX_WR and Sn_TX_FSR
+   * both showed zero change — while the library's own send path still worked.
+   */
+  w5k_flush_write();
 }
+
 
 W5500Eth::W5500Eth()
   : eth_netif(nullptr), linkUp(false), useDhcp(false), intPin(-1), rstPin(-1),

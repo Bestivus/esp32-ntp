@@ -206,6 +206,12 @@ void NtpStats::handleConnection() {
   bool locked = (gps && gps->isLocked());
   uint32_t reqCount = ntp ? ntp->getRequestCount() : 0;
   uint32_t rxIrqCount = ntp ? ntp->getRxIrqCount() : 0;
+  uint32_t lateOk = ntp ? ntp->getLateStampOk() : 0;
+  uint32_t lateFb = ntp ? ntp->getLateStampFallbacks() : 0;
+  int lastStageRc = ntp ? ntp->getLastStageRc() : 0;
+  int lastWrDelta = ntp ? ntp->getLastWrDelta() : 0;
+  uint32_t turnN = ntp ? ntp->getTurnSamples() : 0;
+  double turnUs = ntp ? ntp->getTurnUs() : 0.0;
   double txCorrUs = ntp ? ntp->getTxCorrectionUs() : 0.0;
   double uptimeSec = (double)esp_timer_get_time() / 1e6;
   int stratum = locked ? 1 : 16;
@@ -221,7 +227,7 @@ void NtpStats::handleConnection() {
   int w5500Ver        = eth ? (int)eth->readVersion() : -1;
   uint32_t chipResets = eth ? eth->getChipResetCount() : 0;
 
-  static char resp[4096];
+  static char resp[8192];
   static const int hdrReserve = 128;
   char* body = resp + hdrReserve;
   int blen = snprintf(body, sizeof(resp) - hdrReserve,
@@ -264,8 +270,18 @@ void NtpStats::handleConnection() {
     "# HELP ntp_gps_holdover 1 when coasting on the oscillator (GPS lost, sync still credible)\n"
     "# TYPE ntp_gps_holdover gauge\n"
     "ntp_gps_holdover %d\n"
+    "# HELP ntp_tx_late_stamp_total Replies sent with t3 patched in place before SEND\n"
+    "# TYPE ntp_tx_late_stamp_total counter\n"
+    "# HELP ntp_tx_late_stamp_fallback_total Replies that fell back to the library send\n"
+    "# TYPE ntp_tx_late_stamp_fallback_total counter\n"
     "# HELP ntp_rx_irq_total W5500 RX interrupts captured (hardware arrival edges)\n"
     "# TYPE ntp_rx_irq_total counter\n"
+    "ntp_tx_late_stamp_total %" PRIu32 "\n"
+    "ntp_tx_late_stamp_fallback_total %" PRIu32 "\n"
+    "ntp_tx_stage_last_rc %d\n"
+    "ntp_tx_wr_delta %d\n"
+    "ntp_tx_turnaround_us %.2f\n"
+    "ntp_tx_turnaround_samples %" PRIu32 "\n"
     "ntp_rx_irq_total %" PRIu32 "\n"
     "# HELP ntp_tx_correction_us Self-calibrated transmit-path correction added to t3\n"
     "# TYPE ntp_tx_correction_us gauge\n"
@@ -293,7 +309,58 @@ void NtpStats::handleConnection() {
     "ntp_w5500_version %d\n"
     "# HELP ntp_w5500_chip_resets_total W5500 register-loss events recovered in place (chip reset without a device reboot)\n"
     "# TYPE ntp_w5500_chip_resets_total counter\n"
-    "ntp_w5500_chip_resets_total %" PRIu32 "\n",
+    "ntp_w5500_chip_resets_total %" PRIu32 "\n"
+    "# HELP ntp_gps_fix_quality GGA fix quality (0 none, 1 GPS, 2 DGPS, 4 RTK fix, 5 RTK float)\n"
+    "# TYPE ntp_gps_fix_quality gauge\n"
+    "ntp_gps_fix_quality %d\n"
+    "# HELP ntp_gps_fix_mode GSA fix mode (1 none, 2 = 2D, 3 = 3D)\n"
+    "# TYPE ntp_gps_fix_mode gauge\n"
+    "ntp_gps_fix_mode %d\n"
+    "# HELP ntp_gps_satellites_used Satellites in the position solution\n"
+    "# TYPE ntp_gps_satellites_used gauge\n"
+    "ntp_gps_satellites_used %d\n"
+    "# HELP ntp_gps_satellites_visible Satellites in view across all constellations\n"
+    "# TYPE ntp_gps_satellites_visible gauge\n"
+    "ntp_gps_satellites_visible %d\n"
+    "# HELP ntp_gps_satellites_in_view Satellites in view, by constellation\n"
+    "# TYPE ntp_gps_satellites_in_view gauge\n"
+    "ntp_gps_satellites_in_view{constellation=\"gps\"} %d\n"
+    "ntp_gps_satellites_in_view{constellation=\"glonass\"} %d\n"
+    "ntp_gps_satellites_in_view{constellation=\"galileo\"} %d\n"
+    "ntp_gps_satellites_in_view{constellation=\"beidou\"} %d\n"
+    "# HELP ntp_gps_satellites_tracked Satellites reporting a non-zero C/N0\n"
+    "# TYPE ntp_gps_satellites_tracked gauge\n"
+    "ntp_gps_satellites_tracked %d\n"
+    "# HELP ntp_gps_cn0_max_db Strongest tracked signal, dB-Hz\n"
+    "# TYPE ntp_gps_cn0_max_db gauge\n"
+    "ntp_gps_cn0_max_db %d\n"
+    "# HELP ntp_gps_cn0_mean_db Mean C/N0 over tracked satellites, dB-Hz\n"
+    "# TYPE ntp_gps_cn0_mean_db gauge\n"
+    "ntp_gps_cn0_mean_db %d\n"
+    "# HELP ntp_gps_pdop Position dilution of precision\n"
+    "# TYPE ntp_gps_pdop gauge\n"
+    "ntp_gps_pdop %.2f\n"
+    "# HELP ntp_gps_hdop Horizontal dilution of precision\n"
+    "# TYPE ntp_gps_hdop gauge\n"
+    "ntp_gps_hdop %.2f\n"
+    "# HELP ntp_gps_vdop Vertical dilution of precision\n"
+    "# TYPE ntp_gps_vdop gauge\n"
+    "ntp_gps_vdop %.2f\n"
+    "# HELP ntp_gps_altitude_meters GGA altitude above mean sea level\n"
+    "# TYPE ntp_gps_altitude_meters gauge\n"
+    "ntp_gps_altitude_meters %.1f\n"
+    "# HELP ntp_gps_nmea_age_seconds Age of the newest valid RMC fix\n"
+    "# TYPE ntp_gps_nmea_age_seconds gauge\n"
+    "ntp_gps_nmea_age_seconds %.3f\n"
+    "# HELP ntp_gps_fit_valid Capture-to-GPS-second least-squares fit is solved\n"
+    "# TYPE ntp_gps_fit_valid gauge\n"
+    "ntp_gps_fit_valid %d\n"
+    "# HELP ntp_gps_fit_samples Points in the current fit window\n"
+    "# TYPE ntp_gps_fit_samples gauge\n"
+    "ntp_gps_fit_samples %" PRIu32 "\n"
+    "# HELP ntp_gps_fit_ticks_per_second Fitted capture-timer rate (nominal 80e6); 0 while unsolved\n"
+    "# TYPE ntp_gps_fit_ticks_per_second gauge\n"
+    "ntp_gps_fit_ticks_per_second %.3f\n",
     gs.lastOffsetSec,
     gs.rmsOffsetSec,
     gs.frequencyPpm,
@@ -307,6 +374,12 @@ void NtpStats::handleConnection() {
     gs.ppsRejectCount,
     gs.nmeaMispairCount,
     gs.holdover ? 1 : 0,
+    lateOk,
+    lateFb,
+    lastStageRc,
+    lastWrDelta,
+    turnUs,
+    turnN,
     rxIrqCount,
     txCorrUs,
     resetReason,
@@ -316,8 +389,27 @@ void NtpStats::handleConnection() {
     minFreeHeap,
     ethLink,
     w5500Ver,
-    chipResets
-  );
+    chipResets,
+  
+    gs.fixQuality,
+    gs.fixMode,
+    gs.satsUsed,
+    gs.satsVisible,
+    gs.satsGps,
+    gs.satsGlonass,
+    gs.satsGalileo,
+    gs.satsBeidou,
+    gs.satsTracked,
+    gs.cn0Max,
+    gs.cn0Mean,
+    gs.pdop,
+    gs.hdop,
+    gs.vdop,
+    gs.altitudeM,
+    gs.nmeaAgeMs / 1000.0,
+    gs.fitValid ? 1 : 0,
+    gs.fitSamples,
+    gs.fitTicksPerSec);
 
   if (blen < 0 || blen >= (int)(sizeof(resp) - hdrReserve)) {
     blen = (int)(sizeof(resp) - hdrReserve) - 1;

@@ -67,12 +67,31 @@ int getGpsUartRxPin() { return kGpsUartRxPin; }
 int getPpsGpioPin() { return kPpsGpioPin; }
 int64_t getPpsCalibrationUs() { return kPpsCalibrationUs; }
 
+// Served-time calibration, microseconds, SUBTRACTED from both t2 and t3.
+//
+// t2 is latched when INTn asserts, which is after the W5500 has stored the
+// entire frame, so it is systematically late by the chip's receive latency —
+// and NTP's offset formula turns that straight into a positive bias. Measured
+// against a GPS stratum-1 reference on the same switch (no path asymmetry):
+// +15 us median before compensation. Subtracting it from both timestamps
+// shifts the reported clock without touching the round-trip delay.
+int getServeCalibrationUs() { return 15; }
+
 spi_host_device_t getW5500SpiHost() { return kW5500SpiHost; }
 int getW5500CsPin() { return kW5500CsPin; }
 int getW5500MosiPin() { return kW5500MosiPin; }
 int getW5500MisoPin() { return kW5500MisoPin; }
 int getW5500SclkPin() { return kW5500SclkPin; }
 int getW5500IntPin() { return kW5500IntPin; }
+// SPI clock for the W5500. 20 MHz is the long-proven value on this wiring.
+// CEILING: reads are full duplex (the coalescing shim clocks the header out
+// while the payload comes in), and full-duplex transfers routed through the
+// GPIO matrix — which these are, since the SPI pins are arbitrary config
+// values rather than IO_MUX pins — top out at 26.6 MHz. Past that, READS
+// corrupt silently, which surfaces as wrong Sn_TX_FSR/Sn_TX_WR values and
+// therefore malformed packets rather than an obvious failure. Do not exceed
+// 26 MHz without moving SPI to the IO_MUX pins.
+int getW5500SpiHz() { return 20000000; }
 int getW5500RstPin() { return kW5500RstPin; }
 
 bool getNetworkWiznet() {
