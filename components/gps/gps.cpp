@@ -16,6 +16,15 @@ static const char* TAG = "GPS";
 // stays bounded, with root dispersion growing to tell clients honestly.
 static const int64_t kFreshPpsUs = 2500000;            // disciplining considered live within 2.5s of a good PPS
 static const double  kHoldoverDriftFloorPpm = 1.0;     // assume >=1ppm drift in holdover (temperature dominates)
+/*
+ * While disciplined, dispersion must grow at the rate our frequency estimate
+ * could be WRONG, not at the raw frequency error. The fit measures the crystal
+ * at ~27ppm and compensates it; what remains uncertain is that estimate, whose
+ * observed instability is ~0.1ppm/hour. Using the uncorrected 27ppm here
+ * overstated dispersion by two orders of magnitude and pushed the advertised
+ * value to ~31us when the protocol floor is 15.26us anyway.
+ */
+static const double  kDisciplinedDriftPpm = 0.1;
 static const double  kHoldoverMaxDispersionSec = 0.01; // drop the lock once predicted error exceeds 10ms
 static const int64_t kHoldoverMaxUs = 3600LL * 1000000LL; // ...or after 1 hour, whichever first
 
@@ -932,10 +941,13 @@ double GpsDiscipline::getRootDispersion() const {
   // Grow from the last *disciplined* pulse (not merely the last PPS edge), so
   // holdover — GPS pulsing without valid NMEA included — is reported honestly.
   double sinceGoodSec = (double)(esp_timer_get_time() - lastGoodPpsUs) / 1e6;
-  double driftPpm = fabs(filteredFrequencyPpm);
+  double driftPpm = kDisciplinedDriftPpm;
   // The calibrated estimate only holds near the calibration temperature; once
-  // coasting, floor the assumed drift so dispersion doesn't stay optimistic.
-  if (sinceGoodSec > (double)kFreshPpsUs / 1e6) driftPpm = fmax(driftPpm, kHoldoverDriftFloorPpm);
+  // coasting, revert to the raw frequency error floored so dispersion doesn't
+  // stay optimistic. Holdover semantics are unchanged: isLocked() drops the
+  // lock off this same value.
+  if (sinceGoodSec > (double)kFreshPpsUs / 1e6)
+    driftPpm = fmax(fabs(filteredFrequencyPpm), kHoldoverDriftFloorPpm);
   // Use filtered (outlier-immune) RMS and frequency for stable dispersion
   // NTP 16.16 fixed point formatting truncates values below 1/65536 (~15.25µs) to 0.
   // We use a floor of 16µs so dispersion doesn't report as 0.000000.
