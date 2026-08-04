@@ -206,6 +206,8 @@ void NtpStats::handleConnection() {
   bool locked = (gps && gps->isLocked());
   uint32_t reqCount = ntp ? ntp->getRequestCount() : 0;
   uint32_t rxIrqCount = ntp ? ntp->getRxIrqCount() : 0;
+  uint32_t primeSkips = ntp ? ntp->getPrimeSkips() : 0;
+  uint32_t capRejects = ntp ? ntp->getCapRejects() : 0;
   uint32_t lateOk = ntp ? ntp->getLateStampOk() : 0;
   uint32_t lateFb = ntp ? ntp->getLateStampFallbacks() : 0;
   int lastStageRc = ntp ? ntp->getLastStageRc() : 0;
@@ -361,6 +363,12 @@ void NtpStats::handleConnection() {
     "# HELP ntp_gps_nmea_age_seconds Age of the newest valid RMC fix\n"
     "# TYPE ntp_gps_nmea_age_seconds gauge\n"
     "ntp_gps_nmea_age_seconds %.3f\n"
+    "# HELP ntp_arp_prime_skips_total Replies that reused the socket's resolved peer\n"
+    "# TYPE ntp_arp_prime_skips_total counter\n"
+    "ntp_arp_prime_skips_total %" PRIu32 "\n"
+    "# HELP ntp_capture_rejects_total Arrival captures rejected as mis-paired\n"
+    "# TYPE ntp_capture_rejects_total counter\n"
+    "ntp_capture_rejects_total %" PRIu32 "\n"
     "# HELP ts2phc_offset_ns PPS offset against the capture clock, nanoseconds\n"
     "# TYPE ts2phc_offset_ns gauge\n"
     "ts2phc_offset_ns{clock=\"mcpwm0\"} %.1f\n"
@@ -425,6 +433,8 @@ void NtpStats::handleConnection() {
     gs.vdop,
     gs.altitudeM,
     gs.nmeaAgeMs / 1000.0,
+    primeSkips,
+    capRejects,
     gs.lastOffsetSec * 1e9,
     gs.fitValid ? (gs.fitTicksPerSec / 80000000.0 - 1.0) * 1e9 : 0.0,
     gs.fitValid ? 1 : 0,

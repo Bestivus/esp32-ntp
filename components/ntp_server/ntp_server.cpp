@@ -22,6 +22,8 @@ static const char* TAG = "NTP_SRV";
 // arrival instead of when the poll loop happened to read the socket.
 static volatile uint64_t s_rxCaptureUs = 0;
 static volatile uint32_t s_rxIrqCount = 0;
+static uint32_t s_primeSkips = 0;
+static uint32_t s_capRejects = 0;
 static volatile uint32_t s_rxIrqSeq = 0;
 
 // Self-calibrating transmit correction (µs). t3 must be written into the packet
@@ -173,6 +175,8 @@ void NtpServer::reopenSocket() {
   ESP_LOGI(TAG, "NTP W5500 socket reopened (sn=%d port=%d)", sock, port);
 }
 
+uint32_t NtpServer::getPrimeSkips() const { return s_primeSkips; }
+uint32_t NtpServer::getCapRejects() const { return s_capRejects; }
 uint32_t NtpServer::getRxIrqCount() const { return s_rxIrqCount; }
 uint32_t NtpServer::getLateStampOk() const { return s_lateStampOk; }
 uint32_t NtpServer::getLateStampFallbacks() const { return s_lateStampFallbacks; }
@@ -234,6 +238,33 @@ void NtpServer::computeNtpTimestamp(uint64_t monoUs, bool locked, uint32_t& sec1
   gettimeofday(&tv, nullptr);
   sec1900 = (uint32_t)((uint64_t)tv.tv_sec + 2208988800ULL);
   frac = 0;
+}
+
+/*
+ * The W5500 resolves and remembers one destination per socket, so a prime is
+ * only needed when the peer differs from the last one we primed. Priming is not
+ * optional politeness: it forces ARP to complete *before* t3 is patched in, so
+ * SEND egresses immediately after the stamp instead of stalling on resolution
+ * and shipping a timestamp that is already stale. The TTL re-primes a
+ * long-lived peer in case the chip has aged its entry out, which it gives us no
+ * way to query.
+ */
+static uint8_t s_primedIp[4] = {0, 0, 0, 0};
+static uint64_t s_primedUs = 0;
+static const uint64_t kPrimeTtlUs = 10ULL * 1000000ULL;
+
+static bool needsArpPrime(const uint8_t* ip) {
+  uint64_t now = esp_timer_get_time();
+  bool same = (s_primedIp[0] == ip[0] && s_primedIp[1] == ip[1] &&
+               s_primedIp[2] == ip[2] && s_primedIp[3] == ip[3]);
+  if (same && s_primedUs && (now - s_primedUs) < kPrimeTtlUs) {
+    s_primeSkips++;
+    return false;
+  }
+  s_primedIp[0] = ip[0]; s_primedIp[1] = ip[1];
+  s_primedIp[2] = ip[2]; s_primedIp[3] = ip[3];
+  s_primedUs = now;
+  return true;
 }
 
 void NtpServer::loop() {
@@ -374,8 +405,10 @@ void NtpServer::loop() {
     int32_t dsec = (int32_t)(t2_sec - poll_sec);
     double ddiff = (double)dsec +
                    ((double)t2_frac - (double)poll_frac) / 4294967296.0;
-    if (ddiff > -0.050 && ddiff < 0.050) {
+    if (ddiff > -0.002 && ddiff < 0.002) {
       usedCapture = true;
+    } else {
+      s_capRejects++;
     }
   }
   if (!usedCapture)
@@ -470,7 +503,8 @@ void NtpServer::loop() {
      * resolved this peer earlier: a real client that is now over budget was
      * warmed by its own first request, while a spoofed source never was. */
     if (!bucketWarm[b]) return;
-  } else if (w5k_arp_prime((uint8_t)sock, from_ip) != 0) {
+  } else if (needsArpPrime(from_ip) &&
+             w5k_arp_prime((uint8_t)sock, from_ip) != 0) {
     ESP_LOGW(TAG, "ARP unresolved for %d.%d.%d.%d — dropping reply",
              from_ip[0], from_ip[1], from_ip[2], from_ip[3]);
     return;

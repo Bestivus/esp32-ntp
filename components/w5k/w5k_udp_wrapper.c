@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Unlicense
 
 #include "w5k_udp_wrapper.h"
+#include "esp_timer.h"
 #include "wizchip_conf.h"
 #include "socket.h"
 
@@ -139,7 +140,10 @@ int w5k_send_stamp_and_fire(uint8_t socket_num, uint16_t off,
 
 /* Reap the completion. Call after timing has stopped. */
 int w5k_send_reap(uint8_t socket_num) {
-  for (int i = 0; i < 20000; i++) {
+  /* A fixed iteration count is a latency cliff: 20000 register reads is ~180 ms
+   * of spinning. Bound it in time instead. */
+  int64_t deadline = esp_timer_get_time() + 2000;
+  while (esp_timer_get_time() < deadline) {
     uint8_t ir = getSn_IR(socket_num);
     if (ir & Sn_IR_SENDOK) { setSn_IR(socket_num, Sn_IR_SENDOK); return 0; }
     if (ir & Sn_IR_TIMEOUT) { setSn_IR(socket_num, Sn_IR_TIMEOUT); return -1; }

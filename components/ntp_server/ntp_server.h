@@ -16,6 +16,8 @@ public:
   void loop();
   void reopenSocket();   // after a W5500 chip re-init: hardware sockets are gone
   uint32_t getRequestCount() const { return requestCount; }
+  uint32_t getPrimeSkips() const;
+  uint32_t getCapRejects() const;
   uint32_t getRxIrqCount() const;
   uint32_t getLateStampOk() const;
   uint32_t getLateStampFallbacks() const;
