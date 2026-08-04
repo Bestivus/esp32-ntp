@@ -23,6 +23,13 @@ struct GpsSatellite {
 enum GnssSys : uint8_t { GNSS_GPS = 0, GNSS_SBAS, GNSS_GLONASS, GNSS_GALILEO,
                          GNSS_BEIDOU, GNSS_QZSS, GNSS_COUNT };
 
+/*
+ * Wake-on-PPS plumbing, used by the discipline task in app_main. Mirrors the
+ * ntp_register_task/ntp_wait_for_packet pair already proven on the NTP task.
+ */
+void gps_register_task(void* handle);
+bool gps_wait_for_pps(uint32_t timeout_ms);
+
 struct GpsStats {
     double lastOffsetSec;     // last PPS-vs-system offset before correction
     double rmsOffsetSec;      // exponentially-weighted RMS
@@ -56,6 +63,17 @@ struct GpsStats {
     float vdop;
     float altitudeM;          // GGA altitude, metres above MSL
     uint32_t nmeaAgeMs;       // age of the newest valid RMC fix
+
+    /* --- Diagnosis of what rmsOffsetSec actually responds to -----------
+     * rmsOffsetSec is the endpoint residual of the capture fit, not a clock
+     * phase error. Two things are needed to interpret it, and neither was
+     * exported before: how late the handler ran (which is the mechanism it is
+     * routinely blamed on) and how fast the oscillator's frequency is ramping
+     * (which is the mechanism it actually measures). */
+    double ppsHandleLatUs;        // PPS capture -> handler entry, EWMA
+    double ppsHandleLatMaxUs;     // worst seen
+    double freqDriftPpmPerHour;   // d(fractional frequency)/dt
+    double residualPredictedSec;  // |a|*T^2/12 from that drift and the window
 
     /* --- Capture fit (the term that actually sets served accuracy) ----- */
     bool fitValid;
@@ -197,6 +215,13 @@ private:
   double clockCorrectionUs;      // integral servo correction applied to settimeofday
   uint64_t prevPpsEdgeForOffset;  // previous PPS edge for analytical offset
   double lastAppliedTotalCorrUs;  // total correction applied at previous settimeofday
+  /* Diagnosis of the fit-residual metric (see GpsStats). */
+  double statPpsHandleLatUs;
+  double statPpsHandleLatMaxUs;
+  double statFreqDriftPerSec;     // fractional frequency change per second
+  double slopeLagged;             // fitTicksPerSec kDriftLag pulses ago
+  uint32_t slopeLagCount;
+  static const uint32_t kDriftLag = 60;   // 1 min: long enough to beat fit noise
 
   double filteredFrequencyPpm;   // EWMA-smoothed frequency for dispersion calc
   double filteredRmsOffsetSec;   // outlier-immune RMS for dispersion calc

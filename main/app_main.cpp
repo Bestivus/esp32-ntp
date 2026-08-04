@@ -100,12 +100,21 @@ static void display_task(void* arg) {
 
 static void discipline_task(void* arg) {
   esp_task_wdt_add(nullptr);
+  gps_register_task(xTaskGetCurrentTaskHandle());
   for (;;) {
     g_mainLoopBeats++;              /* liveness, exported over /metrics */
+    /*
+     * Wake on the PPS capture edge instead of polling for it. The 50 ms timeout
+     * is a safety net, not the mechanism: it keeps the holdover checks in
+     * GpsDiscipline::loop() running when PPS stops, which is precisely when they
+     * matter. NMEA is not affected — it has its own gps_uart task.
+     *
+     * Note this makes g_mainLoopBeats advance ~20x/s instead of ~500x/s. It is a
+     * liveness heartbeat, so what matters is that it still advances.
+     */
+    gps_wait_for_pps(50);
     if (g_gps) g_gps->loop();
     esp_task_wdt_reset();
-    /* PPS is 1 Hz; 2 ms keeps handle_pps_deferred() prompt without spinning. */
-    vTaskDelay(pdMS_TO_TICKS(2));
   }
 }
 

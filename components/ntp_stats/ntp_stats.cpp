@@ -237,7 +237,7 @@ void NtpStats::handleConnection() {
     "# HELP ntp_clock_offset_seconds Last measured clock offset\n"
     "# TYPE ntp_clock_offset_seconds gauge\n"
     "ntp_clock_offset_seconds %.9f\n"
-    "# HELP ntp_rms_offset_seconds Exponentially weighted RMS offset\n"
+    "# HELP ntp_rms_offset_seconds EW-RMS of the capture-fit endpoint residual. NOT a clock phase error: it is how far the newest PPS deviates from the oscillator's own 240 s trend line, so it responds to frequency RAMP as a*T^2/12. See ntp_gps_freq_drift_ppm_per_hour and ntp_gps_residual_predicted_seconds.\n"
     "# TYPE ntp_rms_offset_seconds gauge\n"
     "ntp_rms_offset_seconds %.9f\n"
     "# HELP ntp_frequency_ppm Estimated frequency error\n"
@@ -384,7 +384,19 @@ void NtpStats::handleConnection() {
     "ntp_gps_fit_samples %" PRIu32 "\n"
     "# HELP ntp_gps_fit_ticks_per_second Fitted capture-timer rate (nominal 80e6); 0 while unsolved\n"
     "# TYPE ntp_gps_fit_ticks_per_second gauge\n"
-    "ntp_gps_fit_ticks_per_second %.3f\n",
+    "ntp_gps_fit_ticks_per_second %.3f\n"
+    "# HELP ntp_pps_handle_latency_us PPS hardware capture to discipline-handler entry\n"
+    "# TYPE ntp_pps_handle_latency_us gauge\n"
+    "ntp_pps_handle_latency_us %.1f\n"
+    "# HELP ntp_pps_handle_latency_max_us Worst PPS capture-to-handler latency seen\n"
+    "# TYPE ntp_pps_handle_latency_max_us gauge\n"
+    "ntp_pps_handle_latency_max_us %.1f\n"
+    "# HELP ntp_gps_freq_drift_ppm_per_hour Rate of change of the fitted oscillator frequency\n"
+    "# TYPE ntp_gps_freq_drift_ppm_per_hour gauge\n"
+    "ntp_gps_freq_drift_ppm_per_hour %.4f\n"
+    "# HELP ntp_gps_residual_predicted_seconds Fit endpoint residual predicted from that drift alone (a*T^2/12); compare against ntp_rms_offset_seconds\n"
+    "# TYPE ntp_gps_residual_predicted_seconds gauge\n"
+    "ntp_gps_residual_predicted_seconds %.9f\n",
     gs.lastOffsetSec,
     gs.rmsOffsetSec,
     gs.frequencyPpm,
@@ -440,7 +452,11 @@ void NtpStats::handleConnection() {
     gs.fitValid ? (gs.fitTicksPerSec / 80000000.0 - 1.0) * 1e9 : 0.0,
     gs.fitValid ? 1 : 0,
     gs.fitSamples,
-    gs.fitTicksPerSec);
+    gs.fitTicksPerSec,
+    gs.ppsHandleLatUs,
+    gs.ppsHandleLatMaxUs,
+    gs.freqDriftPpmPerHour,
+    gs.residualPredictedSec);
 
   /*
    * Reply-path attribution. Labelled series rather than one metric per span so

@@ -37,6 +37,8 @@ GpsDiscipline::GpsDiscipline()
     ppsIntervalMeanUs(0), ppsJitterVarUs2(0),
     clockCorrectionUs(0),
     prevPpsEdgeForOffset(0), lastAppliedTotalCorrUs(0),
+    statPpsHandleLatUs(0), statPpsHandleLatMaxUs(0),
+    statFreqDriftPerSec(0), slopeLagged(0), slopeLagCount(0),
     filteredFrequencyPpm(0), filteredRmsOffsetSec(0),
     capTimer(nullptr), capChannel(nullptr), rxCapChannel(nullptr),
     rxCapTick(0), rxCapSeq(0),
@@ -87,6 +89,16 @@ esp_err_t GpsDiscipline::begin(int uartPort_, int baud_, int txPin_, int rxPin_,
   return ESP_OK;
 }
 
+/* Discipline task to wake when the PPS edge is captured. */
+static volatile TaskHandle_t s_disciplineTask = nullptr;
+
+void gps_register_task(void* handle) { s_disciplineTask = (TaskHandle_t)handle; }
+
+bool gps_wait_for_pps(uint32_t timeout_ms) {
+  if (s_disciplineTask == nullptr) gps_register_task(xTaskGetCurrentTaskHandle());
+  return ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms)) > 0;
+}
+
 bool IRAM_ATTR GpsDiscipline::pps_capture_callback(
     mcpwm_cap_channel_handle_t cap_channel,
     const mcpwm_capture_event_data_t* edata,
@@ -100,7 +112,25 @@ bool IRAM_ATTR GpsDiscipline::pps_capture_callback(
   self->ppsEdgeUs = esp_timer_get_time();
   __sync_synchronize();
   self->ppsSeq = self->ppsSeq + 1;
-  return false;  // no high-priority task wakeup needed
+  /*
+   * Wake the discipline task on the edge itself rather than letting it discover
+   * the pulse on its next poll.
+   *
+   * NOTE ON WHAT THIS DOES AND DOES NOT FIX. Polling every 2 ms meant the
+   * handler ran up to ~2 ms after the capture (measured: 659 us mean, 1977 us
+   * max). That latency does NOT enter the reported offset: handle_pps_deferred()
+   * computes it as fitResidualTicks / fitTicksPerSec, and both come only from
+   * MCPWM capture ticks and NMEA second labels. It does not enter the system
+   * clock either — settimeofday() adds back (now - ppsEdgeCapture) exactly, as
+   * does the PPS/NMEA mispair guard. What it did cost is anchor freshness: for
+   * the first couple of milliseconds after each pulse, lastPpsMonotonicUs and
+   * the capture anchor still described the PREVIOUS pulse, so a request landing
+   * in that window extrapolated a full second instead of nearly zero. Small
+   * (~10 ns at the disciplined frequency error) but free to remove.
+   */
+  BaseType_t hpw = pdFALSE;
+  if (s_disciplineTask) vTaskNotifyGiveFromISR((TaskHandle_t)s_disciplineTask, &hpw);
+  return hpw == pdTRUE;
 }
 
 // --- Phase/frequency fit ------------------------------------------------
@@ -587,6 +617,21 @@ void GpsDiscipline::handle_pps_deferred() {
   ppsSeqSeen = seq;
 
   uint64_t nowUs = esp_timer_get_time();
+  /*
+   * How long after the hardware capture this handler actually ran. Exported
+   * because rms_offset gets blamed on this latency, and the claim is testable:
+   * `offset` below is computed from fitResidualTicks / fitTicksPerSec, both of
+   * which come only from MCPWM capture ticks and NMEA second labels, so no term
+   * in it can depend on this number. Measuring it makes that checkable instead
+   * of arguable.
+   */
+  {
+    double latUs = (double)(int64_t)(nowUs - ppsEdgeCapture);
+    if (latUs >= 0 && latUs < 1e6) {
+      statPpsHandleLatUs += 0.1 * (latUs - statPpsHandleLatUs);
+      if (latUs > statPpsHandleLatMaxUs) statPpsHandleLatMaxUs = latUs;
+    }
+  }
   uint64_t ageUs = nowUs - lastNmeaUpdateUs;
   bool wasLocked = gpsLock;
 
@@ -674,6 +719,23 @@ void GpsDiscipline::handle_pps_deferred() {
       if (fitValid) {
         offset = fitResidualTicks / fitTicksPerSec;  // seconds, signed
         statFrequencyPpm = (fitTicksPerSec / 80000000.0 - 1.0) * 1e6;
+        /*
+         * Frequency ramp rate. This is what the endpoint residual of a
+         * least-squares line actually responds to: for a fit window T under a
+         * constant frequency ramp a, the endpoint residual is a*T^2/12. With
+         * T = 240 s that turns a drift of a few hundredths of a ppm per hour —
+         * i.e. ordinary room-temperature change — into a residual of hundreds
+         * of nanoseconds. Sampled across kDriftLag pulses because the change in
+         * slope from one pulse to the next is pure fit noise.
+         */
+        if (++slopeLagCount >= kDriftLag) {
+          if (slopeLagged != 0.0) {
+            double dFrac = (fitTicksPerSec - slopeLagged) / 80000000.0;
+            statFreqDriftPerSec = dFrac / (double)kDriftLag;
+          }
+          slopeLagged = fitTicksPerSec;
+          slopeLagCount = 0;
+        }
         // The fit IS the smoothed estimate; feed dispersion directly.
         if (filteredFrequencyPpm == 0 && statPpsCount > kFitMinSamples) {
           filteredFrequencyPpm = statFrequencyPpm;
@@ -823,6 +885,15 @@ void GpsDiscipline::handle_pps_deferred() {
 void GpsDiscipline::getStats(GpsStats& out) const {
   out.lastOffsetSec = statLastOffsetSec;
   out.rmsOffsetSec = statRmsOffsetSec;
+  out.ppsHandleLatUs = statPpsHandleLatUs;
+  out.ppsHandleLatMaxUs = statPpsHandleLatMaxUs;
+  out.freqDriftPpmPerHour = statFreqDriftPerSec * 1e6 * 3600.0;
+  {
+    /* a*T^2/12 with T = the fit window actually in use. */
+    double T = (double)fitCount;
+    double a = statFreqDriftPerSec < 0 ? -statFreqDriftPerSec : statFreqDriftPerSec;
+    out.residualPredictedSec = a * T * T / 12.0;
+  }
   out.frequencyPpm = statFrequencyPpm;
   out.ppsJitterSec = statPpsJitterSec;
   out.ppsCount = statPpsCount;
