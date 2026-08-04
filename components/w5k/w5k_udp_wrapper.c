@@ -6,6 +6,7 @@
 #include "socket.h"
 #include "w5500_fast.h"
 #include <string.h>
+#include "esp_attr.h"
 
 /*
  * ---------------------------------------------------------------------------
@@ -72,7 +73,7 @@ int w5k_close(uint8_t socket_num) {
  * and one Sn_CR acceptance poll. `rsr` is the byte count the caller already read
  * with w5k_rx_ready(), passed in rather than re-read.
  */
-int32_t w5k_recvfrom(uint8_t socket_num, uint8_t* buf, uint16_t len,
+IRAM_ATTR int32_t w5k_recvfrom(uint8_t socket_num, uint8_t* buf, uint16_t len,
                      uint8_t* from_ip, uint16_t* from_port, uint16_t rsr) {
   /* One access must fit the SPI peripheral's 64-byte data buffer once the
    * 3-byte W5500 header is included, so the header-plus-payload burst is capped
@@ -129,7 +130,7 @@ int w5k_set_nonblock(uint8_t socket_num) {
   return ctlsocket(socket_num, CS_SET_IOMODE, &mode);
 }
 
-int32_t w5k_rx_ready(uint8_t socket_num) {
+IRAM_ATTR int32_t w5k_rx_ready(uint8_t socket_num) {
   /* One 2-byte burst: atomic on the wire, so the library's do{}while(v != v1)
    * double read (four single-byte accesses) is unnecessary. */
   uint8_t b[2];
@@ -161,7 +162,7 @@ void w5k_enable_sendok_irq(uint8_t socket_num) {
   setSn_IMR(socket_num, (uint8_t)(Sn_IR_RECV | Sn_IR_SENDOK));
 }
 
-void w5k_clear_rx_irq(uint8_t socket_num) {
+IRAM_ATTR void w5k_clear_rx_irq(uint8_t socket_num) {
   uint8_t v = Sn_IR_RECV;
   w5k_xfer_wr(SN_SREG(socket_num, OFF_SN_IR), &v, 1);
 }
@@ -199,7 +200,7 @@ void w5k_tx_ptrs(uint8_t socket_num, uint16_t* rd, uint16_t* wr, uint16_t* fsr) 
  * there is no pointer arithmetic to lose — and only those 8 bytes plus the
  * SEND command sit between stamping t3 and the packet leaving.
  */
-int w5k_send_stage(uint8_t socket_num, const uint8_t* buf, uint16_t len,
+IRAM_ATTR int w5k_send_stage(uint8_t socket_num, const uint8_t* buf, uint16_t len,
                    const uint8_t* to_ip, uint16_t to_port, uint16_t* stamp_off,
                    int* wr_delta) {
   /*
@@ -260,7 +261,7 @@ int w5k_send_stage(uint8_t socket_num, const uint8_t* buf, uint16_t len,
  * deliberately omitted: it only confirms the chip took the command, and the next
  * Sn_CR write is the following packet's RECV, milliseconds away.
  */
-int w5k_send_stamp_and_fire(uint8_t socket_num, uint16_t off,
+IRAM_ATTR int w5k_send_stamp_and_fire(uint8_t socket_num, uint16_t off,
                             const uint8_t* stamp, uint16_t len) {
   w5k_xfer_wr(SN_TXBUF(socket_num, off), stamp, len);
   uint8_t cmd = Sn_CR_SEND;
@@ -269,7 +270,7 @@ int w5k_send_stamp_and_fire(uint8_t socket_num, uint16_t off,
 }
 
 /* Reap the completion. Call after timing has stopped. */
-int w5k_send_reap(uint8_t socket_num) {
+IRAM_ATTR int w5k_send_reap(uint8_t socket_num) {
   /* A fixed iteration count is a latency cliff: 20000 register reads is ~180 ms
    * of spinning. Bound it in time instead. */
   int64_t deadline = esp_timer_get_time() + 2000;

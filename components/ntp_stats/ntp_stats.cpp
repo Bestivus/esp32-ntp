@@ -477,12 +477,21 @@ void NtpStats::handleConnection() {
       "# HELP ntp_path_samples Packets folded into the span EWMAs\n"
       "# TYPE ntp_path_samples counter\n"
       "ntp_path_samples %" PRIu32 "\n"
-      "# HELP ntp_spi_txns_per_reply SPI transactions issued per served reply\n"
+      "# HELP ntp_spi_txns_per_reply SPI transactions per loop() body, ARP prime INCLUDED\n"
       "# TYPE ntp_spi_txns_per_reply gauge\n"
       "ntp_spi_txns_per_reply %.2f\n"
-      "# HELP ntp_spi_bytes_per_reply Bytes clocked per served reply, headers included\n"
+      "# HELP ntp_spi_txns_per_reply_serve SPI transactions for the reply itself, ARP prime excluded\n"
+      "# TYPE ntp_spi_txns_per_reply_serve gauge\n"
+      "ntp_spi_txns_per_reply_serve %.2f\n"
+      "# HELP ntp_spi_txns_per_prime SPI transactions spent inside w5k_arp_prime (mostly Sn_IR polls, so this RISES as SPI gets faster)\n"
+      "# TYPE ntp_spi_txns_per_prime gauge\n"
+      "ntp_spi_txns_per_prime %.2f\n"
+      "# HELP ntp_spi_bytes_per_reply Bytes clocked per loop() body, headers included\n"
       "# TYPE ntp_spi_bytes_per_reply gauge\n"
       "ntp_spi_bytes_per_reply %.2f\n"
+      "# HELP ntp_spi_bytes_per_reply_serve Bytes clocked for the reply itself, ARP prime excluded\n"
+      "# TYPE ntp_spi_bytes_per_reply_serve gauge\n"
+      "ntp_spi_bytes_per_reply_serve %.2f\n"
       "# HELP ntp_spi_selects_per_reply wizchip_select() calls per served reply\n"
       "# TYPE ntp_spi_selects_per_reply gauge\n"
       "ntp_spi_selects_per_reply %.2f\n"
@@ -497,8 +506,26 @@ void NtpStats::handleConnection() {
       "ntp_arp_primes_total %" PRIu32 "\n",
       ntp_prof_ewma_us(NTP_PROF_INT_TO_SEND),
       ntp_prof_samples(),
-      ntp_prof_txns(), ntp_prof_bytes(), ntp_prof_sels(),
+      ntp_prof_txns(), ntp_prof_txns_serve(), ntp_prof_prime_txns(),
+      ntp_prof_bytes(), ntp_prof_bytes_serve(), ntp_prof_sels(),
       ntp_prof_reap_polls(), ntp_prof_prime_polls(), ntp_prof_primes());
+
+    /* Cumulative histogram of int_to_send, so the bimodality is visible and a
+     * percentile can be read off directly rather than inferred from an EWMA. */
+    blen += snprintf(body + blen, cap - blen,
+      "# HELP ntp_int_to_send_us_bucket Cumulative histogram of arrival-edge to SEND\n"
+      "# TYPE ntp_int_to_send_us_bucket histogram\n");
+    uint32_t cum = 0;
+    for (int i = 0; i < NTP_PROF_BUCKETS && blen < cap - 128; ++i) {
+      cum += ntp_prof_bucket(i);
+      uint32_t e = ntp_prof_bucket_edge_us(i);
+      if (e)
+        blen += snprintf(body + blen, cap - blen,
+          "ntp_int_to_send_us_bucket{le=\"%" PRIu32 "\"} %" PRIu32 "\n", e, cum);
+      else
+        blen += snprintf(body + blen, cap - blen,
+          "ntp_int_to_send_us_bucket{le=\"+Inf\"} %" PRIu32 "\n", cum);
+    }
   }
 
   /*

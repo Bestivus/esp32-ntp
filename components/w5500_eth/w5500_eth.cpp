@@ -208,7 +208,7 @@ static inline void IRAM_ATTR w5k_cs_high(void) {
 
 /* Clock `total` bytes out of s_fast_tx; if `want_rx`, capture them into
  * s_fast_rx. Full duplex, which is what the shim already relies on. */
-static void w5k_fifo_xfer(uint16_t total, bool want_rx) {
+static void IRAM_ATTR w5k_fifo_xfer(uint16_t total, bool want_rx) {
   const size_t bits = (size_t)total * 8;
   g_w5k_txns++; g_w5k_bytes += total; g_w5k_sels++;
 
@@ -244,7 +244,7 @@ static void w5k_fifo_xfer(uint16_t total, bool want_rx) {
 #endif
 }
 
-extern "C" void w5k_xfer_wr(uint32_t addrsel, const uint8_t* buf, uint16_t len) {
+extern "C" void IRAM_ATTR w5k_xfer_wr(uint32_t addrsel, const uint8_t* buf, uint16_t len) {
   if (!g_spi_handle || len == 0 || len > W5K_FAST_MAX) return;
   s_fast_tx[0] = (uint8_t)((addrsel & 0x00FF0000) >> 16);
   s_fast_tx[1] = (uint8_t)((addrsel & 0x0000FF00) >> 8);
@@ -256,7 +256,7 @@ extern "C" void w5k_xfer_wr(uint32_t addrsel, const uint8_t* buf, uint16_t len) 
   w5k_cs_high();
 }
 
-extern "C" void w5k_xfer_rd(uint32_t addrsel, uint8_t* buf, uint16_t len) {
+extern "C" void IRAM_ATTR w5k_xfer_rd(uint32_t addrsel, uint8_t* buf, uint16_t len) {
   if (!g_spi_handle || len == 0 || len > W5K_FAST_MAX) {
     if (buf && len) memset(buf, 0, len);
     return;

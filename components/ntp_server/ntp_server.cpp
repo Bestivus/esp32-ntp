@@ -5,6 +5,7 @@
 #include "config.h"
 #include "gps.h"
 #include "esp_cpu.h"
+#include "esp_attr.h"
 #include <string.h>
 #include <sys/time.h>
 #include "esp_timer.h"
@@ -37,6 +38,25 @@ static bool     s_profSeeded[NTP_PROF_COUNT];
 static uint32_t s_profSamples = 0;
 /* Per-packet SPI accounting, EWMA'd the same way. */
 static double s_profTxns, s_profBytes, s_profSels, s_profReap, s_profPrime;
+static double s_profTxnsServe, s_profBytesServe, s_profPrimeTxns;
+
+/* INT_TO_SEND histogram: the EWMA cannot show a bimodal path, and this one is
+ * bimodal (clean reply vs reply that had to resolve ARP first). */
+static const uint32_t kProfEdges[NTP_PROF_BUCKETS] =
+    { 200, 250, 300, 350, 450, 600, 1000, 0 /* +inf */ };
+static uint32_t s_profHist[NTP_PROF_BUCKETS];
+
+static void prof_hist_add(double us) {
+  for (int i = 0; i < NTP_PROF_BUCKETS; i++) {
+    if (kProfEdges[i] == 0 || us < (double)kProfEdges[i]) { s_profHist[i]++; return; }
+  }
+}
+extern "C" uint32_t ntp_prof_bucket(int i) {
+  return (i >= 0 && i < NTP_PROF_BUCKETS) ? s_profHist[i] : 0;
+}
+extern "C" uint32_t ntp_prof_bucket_edge_us(int i) {
+  return (i >= 0 && i < NTP_PROF_BUCKETS) ? kProfEdges[i] : 0;
+}
 
 /* Argument is in CPU cycles; NTP_PROF_ISR_TO_LOOP and _INT_TO_SEND are fed
  * cycle-equivalents of an esp_timer delta because their two ends are on
@@ -54,8 +74,9 @@ static inline void prof_ewma(double& acc, double v) { acc += 0.05 * (v - acc); }
 
 extern "C" const char* ntp_prof_name(int i) {
   static const char* const kNames[NTP_PROF_COUNT] = {
-    "isr_to_loop", "rx_ready", "rx_stamp", "recvfrom", "build", "arp_prime",
-    "stage", "t3_calc", "stamp_send", "reap", "post", "int_to_send", "total"
+    "isr_to_loop", "rx_ready", "rx_stamp", "recvfrom", "hdr", "t2_convert",
+    "kod", "arp_prime", "stage", "t3_calc", "stamp_send", "reap", "post",
+    "int_to_send", "int_to_send_noarp", "total"
   };
   return (i >= 0 && i < NTP_PROF_COUNT) ? kNames[i] : "?";
 }
@@ -70,7 +91,10 @@ extern "C" double ntp_prof_min_us(int i) {
 }
 extern "C" uint32_t ntp_prof_samples(void) { return s_profSamples; }
 extern "C" double ntp_prof_txns(void)        { return s_profTxns; }
+extern "C" double ntp_prof_txns_serve(void)  { return s_profTxnsServe; }
+extern "C" double ntp_prof_prime_txns(void)  { return s_profPrimeTxns; }
 extern "C" double ntp_prof_bytes(void)       { return s_profBytes; }
+extern "C" double ntp_prof_bytes_serve(void) { return s_profBytesServe; }
 extern "C" double ntp_prof_sels(void)        { return s_profSels; }
 extern "C" double ntp_prof_reap_polls(void)  { return s_profReap; }
 extern "C" double ntp_prof_prime_polls(void) { return s_profPrime; }
@@ -142,7 +166,7 @@ static void IRAM_ATTR w5500_rx_isr(void* arg) {
 }
 
 /* Consistent snapshot of the ISR timestamp; false if it could not be read. */
-static bool rx_isr_stamp(uint64_t* out) {
+static bool IRAM_ATTR rx_isr_stamp(uint64_t* out) {
   for (int i = 0; i < 8; i++) {
     uint32_t s1 = s_rxIrqSeq;
     if (s1 & 1) continue;
@@ -154,7 +178,7 @@ static bool rx_isr_stamp(uint64_t* out) {
   return false;
 }
 
-static void wr32(uint8_t* p, int idx, uint32_t v) {
+static void IRAM_ATTR wr32(uint8_t* p, int idx, uint32_t v) {
   p[idx+0] = (uint8_t)(v >> 24);
   p[idx+1] = (uint8_t)(v >> 16);
   p[idx+2] = (uint8_t)(v >> 8);
@@ -162,7 +186,7 @@ static void wr32(uint8_t* p, int idx, uint32_t v) {
 }
 
 /* Subtract microseconds from an NTP sec/frac pair, borrowing correctly. */
-static void ntp_ts_sub_us(uint32_t& sec, uint32_t& frac, int us) {
+static void IRAM_ATTR ntp_ts_sub_us(uint32_t& sec, uint32_t& frac, int us) {
   if (us == 0) return;
   int64_t f = (int64_t)frac - ((int64_t)us * 4294967296LL) / 1000000LL;
   while (f < 0) { f += 4294967296LL; sec -= 1; }
@@ -170,7 +194,7 @@ static void ntp_ts_sub_us(uint32_t& sec, uint32_t& frac, int us) {
   frac = (uint32_t)f;
 }
 
-static void wr_ntp_ts(uint8_t* p, int idx, uint32_t sec, uint32_t frac) {
+static void IRAM_ATTR wr_ntp_ts(uint8_t* p, int idx, uint32_t sec, uint32_t frac) {
   wr32(p, idx, sec);
   wr32(p, idx + 4, frac);
 }
@@ -275,7 +299,7 @@ void NtpServer::setupRxInterrupt() {
   ESP_LOGI(TAG, "W5500 RX+SENDOK capture armed on GPIO%d (sn=%d)", pin, sock);
 }
 
-void NtpServer::computeNtpTimestamp(uint64_t monoUs, bool locked, uint32_t& sec1900, uint32_t& frac) {
+void IRAM_ATTR NtpServer::computeNtpTimestamp(uint64_t monoUs, bool locked, uint32_t& sec1900, uint32_t& frac) {
   if (locked && gps) {
     uint64_t lastPpsUs = gps->getLastPpsMonotonicUs();
     uint32_t ppsSec1900, ppsFrac;
@@ -345,13 +369,16 @@ static void arpPrimeMark(const uint8_t* ip) {
   s_primedUs = esp_timer_get_time();
 }
 
-void NtpServer::loop() {
+void IRAM_ATTR NtpServer::loop() {
   if (sock < 0) return;
   /* One instruction, taken unconditionally so the arrival probe below is
    * inside the measured region rather than before it. */
   const uint32_t cLoop = esp_cpu_get_cycle_count();
   uint32_t cA = cLoop, cB = cLoop, cC = cLoop, cD = cLoop, cE = cLoop;
   uint32_t cF = cLoop, cG = cLoop, cH = cLoop, cI = cLoop;
+  uint32_t cHdr = cLoop, cT2 = cLoop;
+  uint32_t primeTxn0 = 0, primeTxn1 = 0;
+  bool paidPrime = false;
   /* Snapshot the SPI counters here, so the arrival probe's own transaction is
    * charged to the packet it detected. */
   const uint32_t txn0   = g_w5k_txns;
@@ -484,6 +511,8 @@ void NtpServer::loop() {
   // Originate timestamp (client's transmit time)
   memcpy(&rsp[24], &req[40], 8);
 
+  cHdr = esp_cpu_get_cycle_count();
+
   // Receive timestamp (t2)
   uint32_t t2_sec, t2_frac;
   bool usedCapture = false;
@@ -514,6 +543,7 @@ void NtpServer::loop() {
    * W5500's receive-store latency, which otherwise reads as clock error. */
   ntp_ts_sub_us(t2_sec, t2_frac, Config::getServeCalibrationUs());
   wr_ntp_ts(rsp, 32, t2_sec, t2_frac);
+  cT2 = esp_cpu_get_cycle_count();
 
   // KoD rate limiting, per client. A single global counter meant one chatty
   // host RATE-limited every other client on the LAN; buckets are keyed by a
@@ -605,11 +635,14 @@ void NtpServer::loop() {
   } else {
     PrimeAction pa = arpPrimeAction(from_ip);
     if (pa == PRIME_NOW) {
+      paidPrime = true;
+      primeTxn0 = g_w5k_txns;
       if (w5k_arp_prime((uint8_t)sock, from_ip) != 0) {
         ESP_LOGW(TAG, "ARP unresolved for %d.%d.%d.%d — dropping reply",
                  from_ip[0], from_ip[1], from_ip[2], from_ip[3]);
         return;
       }
+      primeTxn1 = g_w5k_txns;
       arpPrimeMark(from_ip);
     } else if (pa == PRIME_AFTER) {
       primeAfter = true;
@@ -766,7 +799,9 @@ void NtpServer::loop() {
     prof_add(NTP_PROF_RX_READY,   cA - cLoop);
     prof_add(NTP_PROF_RX_STAMP,   cB - cA);
     prof_add(NTP_PROF_RECVFROM,   cC - cB);
-    prof_add(NTP_PROF_BUILD,      cD - cC);
+    prof_add(NTP_PROF_HDR,        cHdr - cC);
+    prof_add(NTP_PROF_T2CONV,     cT2 - cHdr);
+    prof_add(NTP_PROF_KOD,        cD - cT2);
     prof_add(NTP_PROF_ARP,        cE - cD);
     prof_add(NTP_PROF_STAGE,      cF - cE);
     prof_add(NTP_PROF_T3,         cG - cF);
@@ -777,21 +812,38 @@ void NtpServer::loop() {
     /* Cross-core ends: convert the esp_timer deltas into cycle-equivalents so
      * every span reads out through the same divisor. */
     if (isrStampUs && txEnd > isrStampUs && (txEnd - isrStampUs) < 100000) {
-      prof_add(NTP_PROF_INT_TO_SEND,
-               (uint32_t)((double)(txEnd - isrStampUs) * kCyclesPerUs));
+      const double itsUs = (double)(txEnd - isrStampUs);
+      prof_add(NTP_PROF_INT_TO_SEND, (uint32_t)(itsUs * kCyclesPerUs));
+      prof_hist_add(itsUs);
+      /* Separate series for replies that did not have to resolve ARP: that is
+       * the software floor, undiluted by an extra frame's wire round trip. */
+      if (!paidPrime)
+        prof_add(NTP_PROF_INT_TO_SEND_NP, (uint32_t)(itsUs * kCyclesPerUs));
       /* loop() entry lands (cA-cLoop) cycles before the arrival probe returned,
        * which is the only point where both timebases are available. */
       double loopEntryUs = (double)txEnd - (double)(cH - cLoop) / kCyclesPerUs;
       double d = loopEntryUs - (double)isrStampUs;
       if (d > 0) prof_add(NTP_PROF_ISR_TO_LOOP, (uint32_t)(d * kCyclesPerUs));
     }
+    /* The ARP prime's own transactions are held apart. Its Sn_IR poll loop spins
+     * for as long as the ARP takes on the wire, so its transaction count RISES as
+     * SPI gets faster — folding it into one total both overstates the cost of
+     * serving a reply and moves the wrong way under optimisation. */
+    const double primeTxns = paidPrime ? (double)(primeTxn1 - primeTxn0) : 0.0;
+    const double allTxns   = (double)(g_w5k_txns - txn0);
     if (s_profSamples == 0) {
-      s_profTxns  = (double)(g_w5k_txns - txn0);
+      s_profTxns  = allTxns;
+      s_profPrimeTxns = primeTxns;
+      s_profTxnsServe = allTxns - primeTxns;
       s_profBytes = (double)(g_w5k_bytes - byte0);
+      s_profBytesServe = s_profBytes;
       s_profSels  = (double)(g_w5k_sels - sel0);
       s_profReap  = (double)(g_w5k_reap_polls - reap0);
       s_profPrime = (double)(g_w5k_prime_polls - prime0);
     } else {
+      prof_ewma(s_profPrimeTxns, primeTxns);
+      prof_ewma(s_profTxnsServe, allTxns - primeTxns);
+      if (!paidPrime) prof_ewma(s_profBytesServe, (double)(g_w5k_bytes - byte0));
       prof_ewma(s_profTxns,  (double)(g_w5k_txns - txn0));
       prof_ewma(s_profBytes, (double)(g_w5k_bytes - byte0));
       prof_ewma(s_profSels,  (double)(g_w5k_sels - sel0));

@@ -202,7 +202,7 @@ esp_err_t GpsDiscipline::beginRxCapture(int intGpio) {
   return mcpwm_capture_channel_enable(rxCapChannel);
 }
 
-bool GpsDiscipline::getRxCapture(uint32_t& capTick, uint32_t& seq) const {
+bool IRAM_ATTR GpsDiscipline::getRxCapture(uint32_t& capTick, uint32_t& seq) const {
   if (rxCapChannel == nullptr) return false;
   uint32_t s1, s2;
   int tries = 0;
@@ -227,7 +227,7 @@ bool GpsDiscipline::getRxCapture(uint32_t& capTick, uint32_t& seq) const {
 static const int64_t kMaxAnchorAgeUs = 20000000;   // 20 s
 static const double kMaxCaptureDeltaTicks = 1.6e9; // ~20 s at 80 MHz
 
-bool GpsDiscipline::captureToNtp(uint32_t capTick, uint32_t& sec1900,
+bool IRAM_ATTR GpsDiscipline::captureToNtp(uint32_t capTick, uint32_t& sec1900,
                                  uint32_t& frac) const {
   if (!fitValid) return false;
   uint32_t aSeq1, aSeq2, aTick, aSec, aFrac;
@@ -559,7 +559,7 @@ void GpsDiscipline::uart_task(void* arg) {
   }
 }
 
-bool GpsDiscipline::getLastPps(uint32_t& sec1900, uint32_t& frac) const {
+bool IRAM_ATTR GpsDiscipline::getLastPps(uint32_t& sec1900, uint32_t& frac) const {
   if (lastPpsSec1900 == 0) return false;
   sec1900 = lastPpsSec1900;
   frac = lastPpsFrac;
