@@ -491,11 +491,14 @@ void NtpStats::handleConnection() {
       "ntp_spi_reap_polls_per_reply %.2f\n"
       "# HELP ntp_spi_prime_polls_per_reply Sn_IR reads spent in w5k_arp_prime\n"
       "# TYPE ntp_spi_prime_polls_per_reply gauge\n"
-      "ntp_spi_prime_polls_per_reply %.2f\n",
+      "ntp_spi_prime_polls_per_reply %.2f\n"
+      "# HELP ntp_arp_primes_total ARP primes actually issued (paid before stamping t3)\n"
+      "# TYPE ntp_arp_primes_total counter\n"
+      "ntp_arp_primes_total %" PRIu32 "\n",
       ntp_prof_ewma_us(NTP_PROF_INT_TO_SEND),
       ntp_prof_samples(),
       ntp_prof_txns(), ntp_prof_bytes(), ntp_prof_sels(),
-      ntp_prof_reap_polls(), ntp_prof_prime_polls());
+      ntp_prof_reap_polls(), ntp_prof_prime_polls(), ntp_prof_primes());
   }
 
   /*
@@ -574,13 +577,23 @@ void NtpStats::handleConnection() {
     // The W5500 socket TX buffer is 2KB; send in <=1KB chunks so a response
     // larger than the buffer can't stall the ioLibrary send (it waits for
     // SENDOK between chunks, so this is safe to chain).
+    /*
+     * The ioLibrary's send() returns SOCK_BUSY (0) — not an error — whenever the
+     * PREVIOUS chunk has not reached SENDOK yet, and it does so regardless of
+     * blocking mode. Treating that as fatal silently truncated every response
+     * past the first chunk or two, which is why the body length varied with load
+     * while Content-Length stayed correct. Retry on 0, bail only on a negative
+     * return, and bound the whole thing in time so a dead peer cannot wedge the
+     * housekeeping slot.
+     */
     int off = 0;
-    while (off < totalLen) {
+    const int64_t deadline = esp_timer_get_time() + 2000000;   /* 2 s */
+    while (off < totalLen && esp_timer_get_time() < deadline) {
       int chunk = totalLen - off;
       if (chunk > 1024) chunk = 1024;
       int32_t r = w5k_tcp_send((uint8_t)sock, (const uint8_t*)resp + off, (uint16_t)chunk);
-      if (r <= 0) break;   // socket closed/errored — stop rather than spin
-      off += r;
+      if (r > 0) off += r;
+      else if (r < 0) break;     // socket closed/errored
     }
     w5k_tcp_disconnect((uint8_t)sock);
     disconnecting = true;

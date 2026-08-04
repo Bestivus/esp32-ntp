@@ -49,7 +49,8 @@ double ntp_prof_txns(void);
 double ntp_prof_bytes(void);
 double ntp_prof_sels(void);
 double ntp_prof_reap_polls(void);
-double ntp_prof_prime_polls(void);
+double   ntp_prof_prime_polls(void);
+uint32_t ntp_prof_primes(void);   /* ARP primes actually performed */
 
 #ifdef __cplusplus
 }

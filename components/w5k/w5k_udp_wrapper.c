@@ -37,10 +37,12 @@
  * either.
  * ---------------------------------------------------------------------------
  */
+#define W5K_CREG(off)     ((uint32_t)(off) << 8)   /* common register block 0 */
 #define SN_SREG(sn, off)  (((uint32_t)(off) << 8) + ((uint32_t)(1u + 4u * (sn)) << 3))
 #define SN_TXBUF(sn, off) (((uint32_t)(off) << 8) + ((uint32_t)(2u + 4u * (sn)) << 3))
 #define SN_RXBUF(sn, off) (((uint32_t)(off) << 8) + ((uint32_t)(3u + 4u * (sn)) << 3))
 
+#define OFF_RTR        0x0019   /* 0x19-0x1A retry time, 0x1B retry count */
 #define OFF_SN_CR      0x0001
 #define OFF_SN_IR      0x0002
 #define OFF_SN_DIPR    0x000C   /* 0x0C..0x0F IP, 0x10..0x11 port: contiguous */
@@ -297,6 +299,8 @@ int w5k_sendto_poll(uint8_t socket_num) {
   return 0;
 }
 
+uint32_t g_w5k_primes = 0;
+
 int w5k_arp_prime(uint8_t socket_num, const uint8_t* ip) {
   /* Send a 1-byte dummy to port 9 (discard protocol) to trigger
      W5500 ARP resolution.  Block until SENDOK so the caller knows
@@ -306,39 +310,51 @@ int w5k_arp_prime(uint8_t socket_num, const uint8_t* ip) {
      services PPS disciplining and DHCP) for the chip's default ~1.8s ARP
      retry budget, so shrink RTR/RCR for the prime: 40ms/try x 2 tries
      ~= 80ms worst case, then restore.  A live LAN host answers ARP in
-     well under 40ms. */
-  uint16_t rtr = getRTR();
-  uint8_t rcr = getRCR();
-  setRTR(400);   /* 40ms per try (unit 100us) */
-  setRCR(1);     /* 1 retry -> ~80ms to TIMEOUT */
+     well under 40ms.
 
-  uint8_t dummy = 0;
-  setSn_DIPR(socket_num, (uint8_t*)ip);
-  setSn_DPORT(socket_num, 9);           /* RFC 863 discard */
+     On the fast accessors throughout: RTR (0x0019-0x001A) and RCR (0x001B) are
+     contiguous in the common register block, so saving and restoring the retry
+     budget is one 3-byte read and two 3-byte writes rather than six accesses.
+     The staging is shared with the reply path. */
+  uint8_t saved[3];
+  w5k_xfer_rd(W5K_CREG(OFF_RTR), saved, 3);
+  const uint8_t tight[3] = { 0x01, 0x90, 0x01 };  /* RTR=400 (40ms), RCR=1 */
+  w5k_xfer_wr(W5K_CREG(OFF_RTR), tight, 3);
+
   /* Clear stale completion flags first: otherwise the poll below can see a
    * previous send's SENDOK and return before ARP has actually resolved. */
-  setSn_IR(socket_num, (uint8_t)(Sn_IR_SENDOK | Sn_IR_TIMEOUT));
-  wiz_send_data(socket_num, &dummy, 1);
-  setSn_CR(socket_num, Sn_CR_SEND);
-  while (getSn_CR(socket_num));
+  uint8_t clr = (uint8_t)(Sn_IR_SENDOK | Sn_IR_TIMEOUT);
+  w5k_xfer_wr(SN_SREG(socket_num, OFF_SN_IR), &clr, 1);
 
+  uint8_t dummy = 0;
+  uint16_t off = 0;
   int ret = -1;
-  for (int i = 0; i < 20000; i++) {     /* backstop; TIMEOUT IR fires first */
-    g_w5k_prime_polls++;
-    uint8_t ir = getSn_IR(socket_num);
-    if (ir & Sn_IR_SENDOK) {
-      setSn_IR(socket_num, Sn_IR_SENDOK);
-      ret = 0;
-      break;
-    }
-    if (ir & Sn_IR_TIMEOUT) {
-      setSn_IR(socket_num, Sn_IR_TIMEOUT);
-      break;
+  if (w5k_send_stage(socket_num, &dummy, 1, ip, 9, &off, NULL) == 0) {
+    uint8_t cmd = Sn_CR_SEND;
+    w5k_xfer_wr(SN_SREG(socket_num, OFF_SN_CR), &cmd, 1);
+    /* Time-bounded rather than iteration-bounded: the chip's own TIMEOUT fires
+     * first at ~80ms, this is only a backstop against a wedged interface. */
+    const int64_t deadline = esp_timer_get_time() + 120000;
+    while (esp_timer_get_time() < deadline) {
+      uint8_t ir = 0;
+      g_w5k_prime_polls++;
+      w5k_xfer_rd(SN_SREG(socket_num, OFF_SN_IR), &ir, 1);
+      if (ir & Sn_IR_SENDOK) {
+        uint8_t c = Sn_IR_SENDOK;
+        w5k_xfer_wr(SN_SREG(socket_num, OFF_SN_IR), &c, 1);
+        ret = 0;
+        break;
+      }
+      if (ir & Sn_IR_TIMEOUT) {
+        uint8_t c = Sn_IR_TIMEOUT;
+        w5k_xfer_wr(SN_SREG(socket_num, OFF_SN_IR), &c, 1);
+        break;
+      }
     }
   }
 
-  setRTR(rtr);
-  setRCR(rcr);
+  w5k_xfer_wr(W5K_CREG(OFF_RTR), saved, 3);
+  g_w5k_primes++;
   return ret;
 }
 

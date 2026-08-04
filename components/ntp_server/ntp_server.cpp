@@ -23,6 +23,7 @@ static const char* TAG = "NTP_SRV";
 extern "C" {
 extern volatile uint32_t g_w5k_txns, g_w5k_bytes, g_w5k_sels;
 extern volatile uint32_t g_w5k_reap_polls, g_w5k_prime_polls;
+extern uint32_t g_w5k_primes;
 }
 
 /* CPU cycles per microsecond. The NTP task is pinned, so the per-core cycle
@@ -73,6 +74,7 @@ extern "C" double ntp_prof_bytes(void)       { return s_profBytes; }
 extern "C" double ntp_prof_sels(void)        { return s_profSels; }
 extern "C" double ntp_prof_reap_polls(void)  { return s_profReap; }
 extern "C" double ntp_prof_prime_polls(void) { return s_profPrime; }
+extern "C" uint32_t ntp_prof_primes(void)  { return g_w5k_primes; }
 
 // W5500 RX interrupt capture: the INTn pin (active-low) asserts on packet
 // arrival. The GPIO ISR latches a monotonic timestamp at the edge — the same

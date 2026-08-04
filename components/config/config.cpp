@@ -75,7 +75,14 @@ int64_t getPpsCalibrationUs() { return kPpsCalibrationUs; }
 // against a GPS stratum-1 reference on the same switch (no path asymmetry):
 // +15 us median before compensation. Subtracting it from both timestamps
 // shifts the reported clock without touching the round-trip delay.
-int getServeCalibrationUs() { return 15; }
+//
+// RE-DERIVED after the reply path was cut from ~2.1 ms to ~0.4 ms. The old 15 us
+// was measured when the transmit path still stamped t3 well before the frame
+// actually left, and that residual lateness partly cancelled the subtraction.
+// With t3 now landing within ~5 us of egress the subtraction stopped being
+// cancelled and over-corrected: served offset sat at -6..-12 us median against
+// the GPS reference across three 60-sample runs. 7 us re-centres it.
+int getServeCalibrationUs() { return 7; }
 
 spi_host_device_t getW5500SpiHost() { return kW5500SpiHost; }
 int getW5500CsPin() { return kW5500CsPin; }
