@@ -15,8 +15,22 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "lwip/sockets.h"
+// WIZnet's w5500.h (pulled in transitively by w5k_tcp_wrapper.h) #defines
+// SOCK_STREAM/SOCK_DGRAM as aliases for its own Sn_MR_TCP/Sn_MR_UDP constants,
+// with no include guard against them already being defined -- and lwip's
+// sockets.h above already defined them to the real POSIX values (1 and 2).
+// socket(AF_INET, SOCK_STREAM, 0) below needs the real lwip value, so hide it
+// only for WIZnet's header, then restore it immediately after.
+#pragma push_macro("SOCK_STREAM")
+#pragma push_macro("SOCK_DGRAM")
+#undef SOCK_STREAM
+#undef SOCK_DGRAM
 #include "w5k_tcp_wrapper.h"
+#pragma pop_macro("SOCK_DGRAM")
+#pragma pop_macro("SOCK_STREAM")
 
 // Liveness/boot diagnostics published by app_main (read-only here).
 extern volatile uint32_t g_mainLoopBeats;
@@ -637,6 +651,10 @@ void NtpStats::handleConnection() {
       int32_t r = w5k_tcp_send((uint8_t)sock, (const uint8_t*)resp + off, (uint16_t)chunk);
       if (r > 0) off += r;
       else if (r < 0) break;     // socket closed/errored
+      else vTaskDelay(1);        // SOCK_BUSY (waiting for prior chunk's SENDOK) --
+                                  // yield instead of spinning, so a slow SENDOK
+                                  // can no longer starve other tasks/the idle task
+                                  // for the whole 2s deadline
     }
     w5k_tcp_disconnect((uint8_t)sock);
     disconnecting = true;

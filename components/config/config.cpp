@@ -23,7 +23,7 @@ static const int kSpiMosiPin = 23;     // VSPI MOSI
 static const int kSpiMisoPin = -1;     // Display doesn't need MISO
 static const int kSpiSclkPin = 18;     // VSPI SCLK
 
-static const char* kTimezone = "AST4ADT,M3.2.0,M11.1.0";
+static const char* kTimezone = CONFIG_APP_TZ;
 
 // GPS / PPS
 static const int kGpsUartPort = 2;   // UART2
@@ -47,7 +47,13 @@ const char* getNtpServer() { return kNtpServer; }
 int getNtpPort() { return kNtpPort; }
 int getNtpServerPort() { return kNtpServerPort; }
 
-bool getUseDisplay() { return CONFIG_APP_USE_DISPLAY; }
+bool getUseDisplay() { 
+#ifdef CONFIG_APP_USE_DISPLAY
+	return CONFIG_APP_USE_DISPLAY;
+#else
+	return false;
+#endif
+}
 bool getUsePreSyncGlyph() { return CONFIG_APP_USE_PRESYNC_GLYPH; }
 spi_host_device_t getSpiHost() { return kSpiHost; }
 int getCsPin() { return kCsPin; }
