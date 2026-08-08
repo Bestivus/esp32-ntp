@@ -240,33 +240,15 @@ static void IRAM_ATTR w5k_fifo_xfer(uint16_t total, bool want_rx) {
   spi_ll_user_start(hw);
 
   /*
-   * Bounded wait instead of an unconditional spin. The LL functions used
-   * here are verified byte-for-byte identical between ESP-IDF v5.5 and
-   * v6.0.2 (checked directly against both versions' source), so this isn't
-   * a case of a renamed register field -- something about how the higher-
-   * level SPI driver leaves the peripheral configured before this fast path
-   * takes over apparently differs under v6.0's driver internals, and that's
-   * not yet root-caused. Until it is: 5ms is >>10x the longest real transfer
-   * here (61 bytes at 20MHz is ~25us), so this never trips in normal
-   * operation -- it only fires on a genuine wedge, which degrades to one
-   * possibly-stale transfer instead of a permanent watchdog death spiral.
-   * The first few occurrences are logged with register state to help
-   * root-cause the real issue without flooding the log if it's frequent.
+   * Bounded wait instead of an unconditional spin -- 5ms is >>10x the
+   * longest real transfer here (61 bytes at 20MHz is ~25us), so this never
+   * trips in normal operation. It's a safety net against a genuine wedge
+   * degrading to one possibly-stale transfer instead of a permanent
+   * watchdog death spiral, regardless of cause.
    */
   int64_t deadline = esp_timer_get_time() + 5000;
-  bool done = false;
   while (esp_timer_get_time() < deadline) {
-    if (spi_ll_usr_is_done(hw)) { done = true; break; }
-  }
-  if (!done) {
-    static uint32_t s_timeoutLogs = 0;
-    if (s_timeoutLogs < 5) {
-      s_timeoutLogs++;
-      ESP_LOGE(TAG, "w5k_fifo_xfer: SPI transaction timed out (#%u) -- "
-               "cmd=0x%08x clock=0x%08x slave=0x%08x user=0x%08x",
-               (unsigned)s_timeoutLogs, (unsigned)hw->cmd.val, (unsigned)hw->clock.val,
-               (unsigned)hw->slave.val, (unsigned)hw->user.val);
-    }
+    if (spi_ll_usr_is_done(hw)) break;
   }
 
   if (want_rx) spi_ll_read_buffer(hw, s_fast_rx, bits);
@@ -414,12 +396,6 @@ esp_err_t W5500Eth::begin(spi_host_device_t spiHost, int mosiPin, int misoPin, i
   
   spi_device_interface_config_t devcfg = {};
   devcfg.clock_speed_hz = clockHz;  // honor caller's requested SPI clock
-  // Explicitly pin the clock source rather than leaving this zero-initialized
-  // (which maps to "default" and could silently follow a dynamically-scaled
-  // clock if power management/DFS is active). SPI_CLK_SRC_APB is a fixed,
-  // non-power-managed source -- rules out DFS as a factor in the watchdog
-  // resets seen under v6.0.2, independent of whatever the Kconfig PM default is.
-  devcfg.clock_source = SPI_CLK_SRC_APB;
   devcfg.mode = 0;
   devcfg.spics_io_num = -1;
   devcfg.queue_size = 7;
