@@ -21,3 +21,6 @@ __pycache__/
 # Logs
 *.log
 
+# Local-only planning notes, not for the public fork
+/PLANS.local.md
+
