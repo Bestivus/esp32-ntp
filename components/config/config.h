@@ -53,6 +53,16 @@ bool getUseStaticIp();
 const char* getStaticIp();
 const char* getStaticGw();
 const char* getStaticNetmask();
+
+// MQTT (Home Assistant status publishing, Ethernet only)
+bool getMqttEnable();
+const char* getMqttBrokerIp();
+int getMqttBrokerPort();
+const char* getMqttUsername();
+const char* getMqttPassword();
+const char* getMqttClientId();
+const char* getMqttNodeId();
+int getMqttPublishIntervalS();
 }
 
 

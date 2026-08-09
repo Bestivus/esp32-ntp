@@ -1,3 +1,4 @@
 [submodule "ioLibrary_Driver"]
 	path = ioLibrary_Driver
-	url = https://github.com/Wiznet/ioLibrary_Driver.git
+	url = https://github.com/Bestivus/ioLibrary_Driver.git
+	branch = esp32-ntp-fixes

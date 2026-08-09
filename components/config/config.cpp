@@ -172,4 +172,61 @@ const char* getStaticNetmask() {
 #endif
 }
 
+bool getMqttEnable() {
+#ifdef CONFIG_APP_MQTT_ENABLE
+  return true;
+#else
+  return false;
+#endif
+}
+const char* getMqttBrokerIp() {
+#ifdef CONFIG_APP_MQTT_ENABLE
+  return CONFIG_APP_MQTT_BROKER_IP;
+#else
+  return "";
+#endif
+}
+int getMqttBrokerPort() {
+#ifdef CONFIG_APP_MQTT_ENABLE
+  return CONFIG_APP_MQTT_BROKER_PORT;
+#else
+  return 1883;
+#endif
+}
+const char* getMqttUsername() {
+#ifdef CONFIG_APP_MQTT_ENABLE
+  return CONFIG_APP_MQTT_USERNAME;
+#else
+  return "";
+#endif
+}
+const char* getMqttPassword() {
+#ifdef CONFIG_APP_MQTT_ENABLE
+  return CONFIG_APP_MQTT_PASSWORD;
+#else
+  return "";
+#endif
+}
+const char* getMqttClientId() {
+#ifdef CONFIG_APP_MQTT_ENABLE
+  return CONFIG_APP_MQTT_CLIENT_ID;
+#else
+  return "esp32-ntp";
+#endif
+}
+const char* getMqttNodeId() {
+#ifdef CONFIG_APP_MQTT_ENABLE
+  return CONFIG_APP_MQTT_NODE_ID;
+#else
+  return "esp32ntp";
+#endif
+}
+int getMqttPublishIntervalS() {
+#ifdef CONFIG_APP_MQTT_ENABLE
+  return CONFIG_APP_MQTT_PUBLISH_INTERVAL_S;
+#else
+  return 30;
+#endif
+}
+
 }

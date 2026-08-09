@@ -19,6 +19,12 @@ enum {
 // Open a TCP listen socket on the given port
 int w5k_tcp_listen(uint8_t socket_num, uint16_t port);
 
+// Open a TCP socket and issue a non-blocking connect to a remote peer.
+// Returns 0 once the connect has been issued (caller polls w5k_tcp_status()
+// for W5K_SOCK_ESTABLISHED), or a negative value if the socket could not
+// even be opened/connect could not be issued.
+int w5k_tcp_connect(uint8_t socket_num, const uint8_t ip[4], uint16_t port);
+
 // Get socket status register value
 uint8_t w5k_tcp_status(uint8_t socket_num);
 

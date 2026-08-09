@@ -23,6 +23,7 @@
 #include "esp_task_wdt.h"
 #include "ntp_server.h"
 #include "ntp_stats.h"
+#include "mqtt_publish.h"
 #include "w5500_eth.h"
 #include "wifi_sta.h"
 
@@ -32,6 +33,7 @@ static Display* g_display = nullptr;
 static GpsDiscipline* g_gps = nullptr;
 static NtpServer* g_ntpServer = nullptr;
 static NtpStats* g_ntpStats = nullptr;
+static MqttPublisher* g_mqtt = nullptr;
 static W5500Eth* g_ethernet = nullptr;
 static WifiSta* g_wifi = nullptr;
 static SemaphoreHandle_t g_displayMutex = nullptr;
@@ -147,6 +149,7 @@ static void ntp_task(void* arg) {
       if (g_ethernet) g_ethernet->loop();
       if (g_wifi) g_wifi->loop();
       if (g_ntpStats) g_ntpStats->loop();
+      if (g_mqtt) g_mqtt->loop();
       unsigned long now = esp_timer_get_time() / 1000000ULL;
       if (now - lastLog >= 60) {
         struct timeval tv2; struct tm ti2;
@@ -303,15 +306,34 @@ void app_main() {
   g_ntpServer = new NtpServer();
   g_ntpServer->begin(Config::getNtpServerPort(), g_gps);
   if (g_ethernet) {
-    // A W5500 register loss closes the NTP socket along with everything else;
-    // reopen it whenever the ethernet layer rebuilds the chip.
+    // A W5500 register loss closes every hardware socket along with
+    // everything else -- NTP's and MQTT's alike; reopen/reset them whenever
+    // the ethernet layer rebuilds the chip. W5500Eth has a single callback
+    // slot, so both owners are notified from this one registration.
     g_ethernet->onChipReset([](void*) {
       if (g_ntpServer) g_ntpServer->reopenSocket();
+      if (g_mqtt) MqttPublisher::chipResetTrampoline(g_mqtt);
     }, nullptr);
   }
 
   g_ntpStats = new NtpStats();
   g_ntpStats->begin(8080, g_gps, g_ntpServer, g_ethernet, g_wifi);
+
+  if (Config::getMqttEnable() && Config::getNetworkWiznet() && g_ethernet) {
+    g_mqtt = new MqttPublisher();
+    esp_err_t mqttErr = g_mqtt->begin(
+      Config::getMqttBrokerIp(), Config::getMqttBrokerPort(),
+      Config::getMqttUsername(), Config::getMqttPassword(),
+      Config::getMqttClientId(), Config::getMqttNodeId(),
+      Config::getMqttPublishIntervalS(),
+      g_gps, g_ntpServer, g_ethernet);
+    if (mqttErr != ESP_OK) {
+      ESP_LOGE(TAG, "MQTT publisher init failed: %s", esp_err_to_name(mqttErr));
+      delete g_mqtt;
+      g_mqtt = nullptr;
+    }
+  }
+
   gettimeofday(&tv, nullptr);
   struct tm timeinfo;
   localtime_r(&tv.tv_sec, &timeinfo);

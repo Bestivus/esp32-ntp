@@ -10,7 +10,8 @@ here — this file is the historical/technical record.
 
 **Current status: working.** GPS-locked, Stratum 1, sub-microsecond internal precision (7ns PPS
 jitter, matching/beating the maintainer's own published benchmarks), 12+ hours of clean uptime
-with zero watchdog resets, zero W5500 chip resets, zero PPS rejects.
+with zero watchdog resets, zero W5500 chip resets, zero PPS rejects. MQTT status publishing to
+Home Assistant (Part 6) also confirmed working end-to-end against a real EMQX broker.
 
 ---
 
@@ -182,6 +183,92 @@ diagnostic value and was removed as troubleshooting bloat once the real cause wa
 
 ---
 
+## Part 6: MQTT publishing to Home Assistant, and a real upstream `recv()` bug found along the way
+
+Added a new component (`components/mqtt_publish/`) that publishes GPS/NTP status to an MQTT
+broker with Home Assistant discovery, over the W5500's own hardware TCP socket (socket 3 — 0/1/2
+are DHCP/NTP/stats). Ethernet-only, matching this deployment; WiFi was explicitly out of scope.
+Because GPS/NTP correctness is non-negotiable, this is a hand-rolled, tick-driven state machine
+(`MqttPublisher::loop()`, polled from `ntp_task`'s existing housekeeping slot) that does at most
+one non-blocking socket call per tick and never waits on the network — it reuses only the vendored
+Paho MQTT-C library's wire-format codec (`MQTTSerialize_connect`/`publish`,
+`MQTTPacket_readnb`), not its synchronous `MQTTClient.c`/`mqtt_interface.c` orchestration, which
+would have risked stalling NTP replies.
+
+Getting this actually working against a real broker (EMQX) took an extended debugging session,
+because the symptom — TCP connects, CONNECT is sent, then silence until a 3s timeout — had four
+different real causes layered on top of each other, on top of several plausible-but-wrong network
+theories that packet captures ruled out one at a time:
+
+**Ruled out, in order investigated:** the device being on the wrong subnet from the broker (it
+wasn't, once actually checked with `Test-NetConnection`); asymmetric routing/NAT between the two
+subnets (pfSense confirmed doing plain routing, no NAT); pfSense/IDS actively blocking the device
+after repeated connection attempts (no blocked-clients list, no IDS packages installed); and
+cable-plugged-in-during-boot vs. after-boot timing (no effect on the actual symptom — the
+connection was already long-established by the time it mattered).
+
+**Bug 1 — reused source port across reconnects.** `w5k_tcp_connect()` (added to
+`components/w5k/w5k_tcp_wrapper.c` alongside the existing `w5k_tcp_listen()`) originally picked a
+fixed ephemeral port (`20000 + socket_num`) every time. A packet capture showed the exact
+signature of a stale connection-tracking entry colliding with this: several fully-silent SYN
+cycles in a row (no SYN-ACK at all), then one that got through instantly, repeating. Fixed by
+varying the source port on every call (`20000 + socket_num + counter`).
+
+**Bug 2 — CONNACK discarded on immediate broker close.** `mqttNonBlockingRead()` (the
+`MQTTPacket_readnb` transport callback) originally checked the socket's connection status *before*
+attempting to read. A broker rejecting a connection commonly sends its CONNACK and then
+immediately closes — by the time the check ran, the socket already showed `CLOSE_WAIT`, so the
+CONNACK sitting right behind that transition in the RX buffer was never read, and a real rejection
+was misreported as a bare "connection closed." Fixed by reading first, and treating `CLOSE_WAIT`
+as "keep trying" rather than a hard error.
+
+**Bug 3 — auth field truncation.** `username`/`password`/`clientId` were originally fixed
+32-byte `char[]` members; a real password happened to be exactly 32 characters, silently truncated
+to 31 by `snprintf`, producing a broker-side "bad username/password" (CONNACK rc=4) with no
+firmware-side indication anything was wrong. Fixed by heap-allocating these three fields to fit
+exactly what's configured (`dupString()`), matching MQTT 3.1.1's real 65535-byte limit instead of
+an arbitrary cap.
+
+**Bug 4 — the actual root cause, and the one that took the longest to find.** Even with 1-3 fixed,
+a packet capture proved the broker was sending a valid 4-byte CONNACK within a few milliseconds of
+every single CONNECT, yet the firmware polled for a full 3 seconds and never once saw it —
+`rxAnyByteSeen`/poll-count instrumentation added specifically to chase this showed the read
+callback was being called at the expected ~20ms cadence (142 times over 3s) but never returning a
+single byte, despite the socket genuinely showing `ESTABLISHED` throughout. Root cause: `recv()`
+in the vendored `ioLibrary_Driver/Ethernet/socket.c` checks whether the socket is in non-blocking
+mode *before* checking whether data has actually arrived:
+```c
+if (sock_io_mode & (1 << sn)) {
+    return SOCK_BUSY;      // fires unconditionally, even with data already waiting
+}
+if (recvsize != 0) {
+    break;
+}
+```
+For a non-blocking socket this returns `SOCK_BUSY` on literally every call, regardless of how much
+data is sitting in the RX buffer — the `recvsize` check is unreachable in non-blocking mode. This
+had never surfaced before because nothing else in the project calls `recv()` on a non-blocking TCP
+socket: the stats HTTP server's socket stays in blocking mode, and NTP is UDP with entirely
+separate `sendto`/`recvfrom` fast-path code. MQTT is the first thing here to combine a
+non-blocking TCP socket with this exact function — and needed non-blocking mode specifically so
+`w5k_tcp_connect()`'s `connect()` call wouldn't spin the shared `ntp_task` (see Bug 1's context;
+non-blocking mode is set via `ctlsocket(..., SOCK_IO_NONBLOCK, ...)` right after `socket()`,
+before `connect()`).
+
+The confirming detail: the same function's `#ifdef IPV6_AVAILABLE` branch, three lines above the
+broken one, has the two checks in the *correct* order (data-available wins over would-block) —
+this was a copy-paste divergence in the vendored library, not an intentional design choice, and
+the fix is exactly swapping the two `if` blocks in the non-`IPV6_AVAILABLE` branch to match.
+
+Once this landed, MQTT connected on the very first attempt and stayed connected — confirmed
+against a real EMQX broker with Home Assistant showing the device and all 14 entities populated
+under its MQTT integration. The `rxAnyByteSeen`/poll-count diagnostics used to chase Bug 4, and a
+speculative (and, once Bug 4 was found, unnecessary) workaround for a suspected `MQTTPacket_readnb`
+bitfield-decode ambiguity, were both removed afterward as troubleshooting bloat — same practice as
+Part 5.
+
+---
+
 ## Files modified from upstream, complete list
 
 - `CMakeLists.txt` (top-level) — missing-field-initializer warning suppression
@@ -195,5 +282,13 @@ diagnostic value and was removed as troubleshooting bloat once the real cause wa
   `vTaskDelay(1)` on busy-retry path
 - `components/config/config.cpp` — timezone now reads `CONFIG_APP_TZ`; `getUseDisplay()` `#ifdef`
   guard
-- `main/app_main.cpp` — added `#include <time.h>`; 1x volatile-increment fix
+- `main/app_main.cpp` — added `#include <time.h>`; 1x volatile-increment fix; wires up
+  `MqttPublisher` (Part 6)
 - `sdkconfig` — FreeRTOS tick rate raised from the post-`fullclean` default
+- `ioLibrary_Driver/Ethernet/socket.c` — fixed `recv()`'s non-blocking-mode check firing before its
+  data-available check, so a non-blocking TCP socket could never actually read data (Part 6, Bug 4)
+- `components/w5k/w5k_tcp_wrapper.c`/`.h` — added `w5k_tcp_connect()`, the client-mode counterpart
+  to the existing `w5k_tcp_listen()`, with a per-call ephemeral source port (Part 6, Bug 1)
+- `main/Kconfig.projbuild`, `components/config/config.h`/`.cpp` — new `APP_MQTT_*` options and
+  accessors (Part 6)
+- `components/mqtt_publish/` — new component, not an upstream file (Part 6)
