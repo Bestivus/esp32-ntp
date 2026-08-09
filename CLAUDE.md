@@ -267,6 +267,14 @@ speculative (and, once Bug 4 was found, unnecessary) workaround for a suspected 
 bitfield-decode ambiguity, were both removed afterward as troubleshooting bloat — same practice as
 Part 5.
 
+**Someone else found this independently.** [`Wiznet/ioLibrary_Driver#183`](https://github.com/Wiznet/ioLibrary_Driver/pull/183)
+("fix: check recvsize before nonblocking mode in TCP recv() (AUD-004)"), opened by
+`occamsshavingkit` on 2026-07-18 — about three weeks before we hit it here — proposes the exact
+same reorder at the exact same lines. It was still unmerged as of 2026-08-08, which is why the
+submodule points at a fork (`github.com/Bestivus/ioLibrary_Driver`, branch `esp32-ntp-fixes`)
+rather than waiting on it. **If/when #183 merges upstream**, `.gitmodules` can be pointed back at
+`Wiznet/ioLibrary_Driver` directly and the fork dropped — no need to file a duplicate report.
+
 ---
 
 ## Files modified from upstream, complete list
