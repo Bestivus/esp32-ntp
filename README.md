@@ -1,3 +1,31 @@
+## About this fork
+
+This is a fork of [dniminenn/esp32-ntp](https://github.com/dniminenn/esp32-ntp) - a genuinely
+excellent piece of engineering, and huge thanks to dniminenn for open-sourcing it. Everything below
+this section is the upstream project as-is; here's what changed while bringing it up on my own
+hardware. Most of it has been submitted back upstream as PRs.
+
+- **ESP-IDF v6.0.2 support** ([PR #2](https://github.com/dniminenn/esp32-ntp/pull/2)): fixed
+  eight build errors from ESP-IDF v6.0's driver-component reorganization and stricter
+  warnings-as-errors, plus a runtime bug where a FreeRTOS tick-rate rounding issue turned an
+  intended 5ms wait into an unthrottled busy-loop, causing a task-watchdog reset roughly every 5
+  seconds.
+- **Two Kconfig bug fixes** ([PR #1](https://github.com/dniminenn/esp32-ntp/pull/1)): the
+  timezone setting (`APP_TZ`) was never actually read from Kconfig, and disabling the display in
+  menuconfig broke the build.
+- **3D-printed enclosure** ([PR #3](https://github.com/dniminenn/esp32-ntp/pull/3), see
+  [`hardware/enclosure/`](hardware/enclosure/)): a two-piece, magnet-held case sized for this
+  exact build (D1 Mini ESP32 + W5500 + SparkFun MAX-M10S GPS), STEP and STL included.
+- **MQTT status publishing with Home Assistant discovery** (`components/mqtt_publish/`, kept in
+  this fork only): publishes GPS lock, stratum, offset, jitter, and diagnostics to an MQTT broker
+  with HA auto-discovery, via a hand-rolled non-blocking state machine so it can never delay an
+  NTP reply.
+
+The full technical write-up - root causes, debugging process, everything found and fixed - is in
+[`CLAUDE.md`](CLAUDE.md).
+
+---
+
 # esp32-ntp: a GPS-disciplined Stratum 1 NTP server for the ESP32
 
 **Writeup:** [Building a GPS stratum 1 NTP server on an ESP32](https://dnim.dev/blog/esp32-stratum-1-ntp)
