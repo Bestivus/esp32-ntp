@@ -274,10 +274,12 @@ and the `suggested_display_precision` discovery hint) caps out at 7 decimal plac
 hardware) and `root_dispersion_s` with `%.6f`. Rather than fight that ceiling, switched all three to
 **microseconds** instead of seconds (`offset_us`/`pps_jitter_us`/`root_dispersion_us`, `%.3f` —
 still 1ns resolution, just expressed as a small ordinary-looking number like `0.007` instead of
-`0.000000007`) with `suggested_display_precision: 3`. This was a payload schema change: the old
-`_s`-suffixed entities went stale in HA once the device republished discovery with the new keys,
-and needed a manual cleanup pass (`Settings > Devices & Services > Entities`, filter to
-unavailable, delete the three old ones). **Confirmed working** after flashing: HA shows real
+`0.000000007`) with `suggested_display_precision: 3`. This changed the state-JSON key
+(`offset_s`→`offset_us`, etc.) but **not** the discovery `object_id` (`offset`, `pps_jitter`,
+`root_dispersion` were untouched) — since HA's entity identity comes from `unique_id`
+(`<node_id>_<object_id>`), not the value key inside the payload, the republished (retained)
+discovery config updated the existing entities in place rather than creating new ones or orphaning
+the old ones. No manual cleanup needed. **Confirmed working** after flashing: HA shows real
 decimal values (`Clock Offset -1.319 µs`, `PPS Jitter 0.007000 µs`, `Root Dispersion 17.46 µs`)
 instead of the earlier `0.00000` rounding.
 
