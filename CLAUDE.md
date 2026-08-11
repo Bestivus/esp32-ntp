@@ -267,6 +267,19 @@ speculative (and, once Bug 4 was found, unnecessary) workaround for a suspected 
 bitfield-decode ambiguity, were both removed afterward as troubleshooting bloat — same practice as
 Part 5.
 
+**Follow-up, not yet flashed/tested: display precision.** Once connected, Home Assistant showed
+`Clock Offset`/`PPS Jitter` rounded down to a misleading `0.00000` — HA's per-entity display
+precision (both the manual picker and the `suggested_display_precision` discovery hint) caps out
+at 7 decimal places, but `offset_s`/`pps_jitter_s` are published with `%.9f` (nanosecond
+resolution, the whole point of this hardware) and `root_dispersion_s` with `%.6f`. Rather than
+fight that ceiling, switched all three to **microseconds** instead of seconds
+(`offset_us`/`pps_jitter_us`/`root_dispersion_us`, `%.3f` — still 1ns resolution, just expressed as
+a small ordinary-looking number like `0.007` instead of `0.000000007`) with
+`suggested_display_precision: 3`. This is a payload schema change: the old `_s`-suffixed entities
+will go stale in HA once the device republishes discovery with the new keys, and need a manual
+cleanup pass (`Settings > Devices & Services > Entities`, filter to unavailable, delete the three
+old ones). Not yet verified against real hardware as of this writing.
+
 **Someone else found this independently.** [`Wiznet/ioLibrary_Driver#183`](https://github.com/Wiznet/ioLibrary_Driver/pull/183)
 ("fix: check recvsize before nonblocking mode in TCP recv() (AUD-004)"), opened by
 `occamsshavingkit` on 2026-07-18 — about three weeks before we hit it here — proposes the exact
