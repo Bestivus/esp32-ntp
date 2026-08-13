@@ -10,9 +10,9 @@
 
 namespace Config {
 
-static const char* kNtpServer = "192.168.0.1";
+static const char* kNtpServer = CONFIG_APP_NTP_SERVER;
 static const int kNtpPort = 123;
-static const int kNtpServerPort = 123; // for serving NTP
+static const int kNtpServerPort = CONFIG_APP_NTP_PORT; // for serving NTP
 
 // Display on VSPI (SPI3_HOST)
 static const spi_host_device_t kSpiHost = SPI3_HOST;  // VSPI for display
