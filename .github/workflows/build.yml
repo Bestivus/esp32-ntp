@@ -1,0 +1,20 @@
+# Clean-clone build check: catches IDF compatibility rot and committed-config
+# drift before a contributor does. Pinned to the IDF version in dependencies.lock.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0.2
+          target: esp32
