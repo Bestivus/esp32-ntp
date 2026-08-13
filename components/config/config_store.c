@@ -49,18 +49,11 @@ static const char* NVS_NS = "ntpcfg";
 #define DEF_DISP_EN 0
 #endif
 
-/*
- * GPIO ranges are the real validation here. 34-39 are input-only on the ESP32,
- * so anything that must drive a line is capped at 33; a value outside the range
- * is refused before it can reach flash and take the board off the network.
- */
 #define PIN_OUT -1, 33
 #define PIN_IN  -1, 39
 
 static const char* const kNetModes[] = { "wiznet", "wifi" };
 
-/* POSIX TZ strings with human labels. A stored value that is not in this list
- * still round-trips: the renderer adds it as a selected "custom" entry. */
 static const char* const kTzOpts[] = {
   "UTC0",                                    "UTC",
   "GMT0BST,M3.5.0/1,M10.5.0",                "UK - London",
@@ -259,8 +252,6 @@ void cfg_init(bool safe_mode) {
     } else {
       int32_t v;
       if (nvs_get_i32(h, f->key, &v) == ESP_OK) {
-        /* A stored value outside the current range means the schema tightened
-         * under it; the default is the safe reading, not the stored one. */
         if (v >= f->imin && v <= f->imax) s_val[i].i = v;
         s_stored[i] = true;
         loaded++;
@@ -297,7 +288,6 @@ cfg_id_t cfg_lookup(const char* key) {
   return CFG_COUNT;
 }
 
-/* Dotted-quad only; anything else would reach the W5500 as a silent zero. */
 static bool valid_ipv4(const char* s) {
   int parts = 0;
   while (*s) {
@@ -325,8 +315,6 @@ bool cfg_stage(cfg_id_t id, const char* value) {
     if (id == CFG_NET_IP || id == CFG_NET_GW || id == CFG_NET_MASK) {
       if (!valid_ipv4(value)) return false;
     }
-    /* An empty password field means "leave it alone", so a form round-trip
-     * that never echoes the secret cannot silently clear it. */
     if (f->type == CF_PASS && value[0] == '\0') return true;
     if (strcmp(s_val[id].s, value) != 0) {
       snprintf(s_val[id].s, CFG_STR_MAX, "%s", value);
@@ -357,15 +345,6 @@ bool cfg_clear(cfg_id_t id) {
   return true;
 }
 
-/*
- * A save pins every field, not just the ones that differ from this build's
- * defaults. Writing only changed values looks frugal but is wrong: a setting
- * that happens to equal the current default would never reach flash, and would
- * then silently flip the first time the device runs firmware built with a
- * different default. Once a key is in NVS, later saves skip it unless it really
- * changed, so the cost is one full write on the first save and near nothing
- * after that.
- */
 esp_err_t cfg_commit(void) {
   bool anyUnpinned = false;
   for (int i = 0; i < CFG_COUNT; ++i)
@@ -416,20 +395,6 @@ esp_err_t cfg_factory_reset(void) {
   return err;
 }
 
-/*
- * Boot health is one byte in NVS. RTC RAM was tried first and is wrong for the
- * job: on the ESP32 the EN/RESET line is a power-on-class reset that clears the
- * RTC domain (measured, esp_reset_reason() reports ESP_RST_POWERON), so the
- * counter never advanced across the button presses that are the whole point of
- * a manual recovery.
- *
- * The cost is two byte writes per boot, one to count the attempt and one to
- * clear it once the network is up. NVS wear-levels those across the partition
- * at roughly 126 entries per 4 KB page, so a page erase lands about every 63
- * boots; against ~100k erases per sector that is tens of millions of boots.
- * The write that actually needed avoiding was rewriting all of the settings on
- * every save, and cfg_commit() only touches keys that changed.
- */
 #define BOOT_KEY "boot.fail"
 
 uint8_t cfg_boot_begin(void) {

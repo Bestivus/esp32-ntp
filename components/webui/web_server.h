@@ -46,6 +46,6 @@ private:
   void sendConfigPage(const char* notice);
   void renderSection(char** pp, char* end, bool advanced);
   void renderField(char** pp, char* end, int i);
-  void handleConfigPost(const char* body);
+  void handleConfigPost(char* body);
   bool authorized(const char* req);
 };

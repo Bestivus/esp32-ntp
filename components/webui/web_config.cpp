@@ -30,7 +30,6 @@ static const char* TAG = "WEBUI";
 extern volatile uint32_t g_mainLoopBeats;
 extern uint32_t g_bootCount;
 
-/* %XX and + decoding, in place. */
 static void url_decode(char* s) {
   char* out = s;
   for (; *s; ++s) {
@@ -264,9 +263,8 @@ void WebServer::sendConfigPage(const char* notice) {
  * validation is reported and nothing is written, so a typo in one pin cannot
  * half-apply a settings change.
  */
-void WebServer::handleConfigPost(const char* body) {
-  static char buf[2048];
-  snprintf(buf, sizeof(buf), "%s", body);
+void WebServer::handleConfigPost(char* body) {
+  char* buf = body;
 
   char bad[64] = {0};
   int staged = 0;

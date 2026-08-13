@@ -26,7 +26,6 @@
 #include "lwip/sockets.h"
 
 
-const char* WEB_TAG = "WEBUI";
 static const char* TAG = "WEBUI";
 
 static const uint8_t STATS_SOCKET = 2;
@@ -35,7 +34,7 @@ char g_req[3072];
 char g_resp[26624];
 const int hdrReserve = 128;
 
-const char* ci_find(const char* hay, const char* needle) {
+static const char* ci_find(const char* hay, const char* needle) {
   size_t n = strlen(needle);
   for (const char* p = hay; *p; ++p)
     if (strncasecmp(p, needle, n) == 0) return p;
@@ -265,12 +264,6 @@ void WebServer::sendStatus(const char* status, const char* ctype, const char* bo
   closeConn();
 }
 
-/*
- * Accumulate whatever has arrived and report whether a whole request is in
- * hand. Returning false means "not yet" — the caller returns to the NTP loop
- * and tries again next pass, so a body split across packets costs no blocking
- * time in the task that also answers time requests.
- */
 bool WebServer::pumpRequest() {
   if (reqStartUs == 0) reqStartUs = esp_timer_get_time();
 
@@ -311,8 +304,6 @@ bool WebServer::pumpRequest() {
 
   if (hdrEnd >= 0 && reqLen >= hdrEnd + contentLen) return true;
 
-  // A client that opens a connection and then says nothing must not hold the
-  // single stats socket forever.
   if (esp_timer_get_time() - reqStartUs > 5000000) closeConn();
   return false;
 }
@@ -325,7 +316,6 @@ bool WebServer::authorized(const char* req) {
   if (!h) return false;
   h += 21;
 
-  // "user:pass" base64, any username accepted.
   static const char* B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   char dec[96];
   int dlen = 0, bits = 0, acc = 0;
@@ -351,7 +341,7 @@ void WebServer::handleConnection() {
   if (!pumpRequest()) return;
 
   const char* req = (const char*)g_req;
-  const char* body = req + hdrEnd;
+  char* body = g_req + hdrEnd;
 
   bool isGet  = strncmp(req, "GET ",  4) == 0;
   bool isPost = strncmp(req, "POST ", 5) == 0;

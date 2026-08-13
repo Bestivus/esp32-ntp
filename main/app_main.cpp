@@ -200,10 +200,6 @@ void app_main() {
     ESP_LOGI(TAG, "Boot count: %u, reset reason: %d", (unsigned)g_bootCount, (int)esp_reset_reason());
   }
 
-  // Settings come from NVS, falling back to the build-time defaults for any key
-  // that was never written. Three boots that never reached the network — a bad
-  // pin, or a human pressing RESET repeatedly — serve the defaults instead, so
-  // no committed value can put the device beyond reach of its own config page.
   {
     uint8_t attempt = cfg_boot_begin();
     bool safeMode = attempt >= CFG_SAFE_MODE_FAILS;
