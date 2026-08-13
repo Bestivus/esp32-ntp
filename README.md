@@ -96,15 +96,35 @@ algorithm against three independent clocks rather than by a one-off measurement 
   <img src="docs/esp32-ntp-wiring.svg" alt="ESP32 stratum-1 NTP signal wiring: u-blox NEO-6M GPS (NMEA over UART, PPS into GPIO19 captured by MCPWM), and the WIZnet W5500 over SPI with INTn on GPIO34 for hardware RX timestamping. The two hardware-timestamped nets, PPS and INTn, are in coral." width="720">
 </p>
 
-- **MCU:** the original ESP32 (IDF target `esp32`). It is the only part this has been built and
-  measured on. The approach rests on the **MCPWM capture** peripheral latching the PPS edge in
-  silicon, which splits the family in two (per `soc_caps.h` in ESP-IDF v6.0.2):
-  - **No MCPWM at all, so nothing to port to:** ESP32-S2, ESP32-C2, ESP32-C3, ESP32-C61.
-  - **Has MCPWM, so conceivably portable, but untried here:** ESP32-S3, ESP32-C5, ESP32-C6,
-    ESP32-H2, ESP32-H21, ESP32-H4, ESP32-P4. Expect work beyond the capture path: the pin map
-    assumes ESP32 GPIO numbering and its input-only 34 to 39, and the SPI host numbering differs.
+- **MCU:** the original ESP32 (IDF target `esp32`). 2 MB of flash is enough; the app partition is
+  1.9 MB and about half free.
 
-  2 MB of flash is enough; the app partition is 1.9 MB and about half free.
+  Three SoC capabilities decide whether a part in the family can run this at all. **MCPWM**, because
+  the PPS edge is latched by the capture submodule (capture is not separately gated: ESP-IDF builds
+  `mcpwm_cap.c` on `SOC_MCPWM_SUPPORTED` alone, and the capture registers are present in every
+  MCPWM-bearing target). **Two usable SPI hosts**, because SPI1 is tied to flash and the W5500 and
+  the display each need their own bus, so `SOC_SPI_PERIPH_NUM` has to be 3. **A WiFi radio**, because
+  `wifi_sta` is linked unconditionally today, which is a build artifact rather than a design
+  requirement. Checked against `soc_caps.h` in ESP-IDF v6.0.2:
+
+  | Target | MCPWM | Usable SPI | WiFi | Verdict |
+  |---|---|---|---|---|
+  | **ESP32** | yes | 2 | yes | **Supported. The only part built and measured.** |
+  | **ESP32-S3** | yes | 2 | yes | **Meets every requirement. Never built here.** |
+  | ESP32-C5 | yes | 1 | yes | Only without the display, one bus for the W5500 |
+  | ESP32-C6 | yes | 1 | yes | Only without the display, one bus for the W5500 |
+  | ESP32-S2 | no | 2 | yes | Impossible, no MCPWM |
+  | ESP32-C2 | no | 1 | yes | Impossible, no MCPWM |
+  | ESP32-C3 | no | 1 | yes | Impossible, no MCPWM |
+  | ESP32-C61 | no | 1 | yes | Impossible, no MCPWM |
+  | ESP32-H4 | yes | 2 | no | Blocked only by the unconditional `wifi_sta` |
+  | ESP32-P4 | yes | 2 | no | Blocked only by the unconditional `wifi_sta` |
+  | ESP32-H2 | yes | 1 | no | Blocked by `wifi_sta`, and display-less even then |
+  | ESP32-H21 | yes | 1 | no | Blocked by `wifi_sta`, and display-less even then |
+
+  The four "impossible" rows have no MCPWM and no path forward. The H4 and P4 rows would come into
+  range if `wifi_sta` were made conditional on the selected interface. Anything other than the ESP32
+  also needs the pin map revisited, which assumes ESP32 GPIO numbering and its input-only 34 to 39.
 - **Toolchain:** ESP-IDF **v6.0**. Earlier versions predate the split driver components
   (`esp_driver_gpio`, `esp_driver_uart`, `esp_driver_spi`, `esp_driver_mcpwm`) that this project
   requires, so they fail at configure time rather than building something subtly wrong. CI builds
