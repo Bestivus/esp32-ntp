@@ -11,17 +11,17 @@
 namespace Config {
 
 static const char* kNtpServer = CONFIG_APP_NTP_SERVER;
-static const int kNtpPort = 123;
 static const int kNtpServerPort = CONFIG_APP_NTP_PORT; // for serving NTP
 
-// Display on VSPI (SPI3_HOST)
-static const spi_host_device_t kSpiHost = SPI3_HOST;  // VSPI for display
-static const int kCsPin = 5;           // MAX7219 display CS pin
-static const int kMaxDevices = 4;
-static const int kSpiClockHz = 10 * 1000 * 1000;
-static const int kSpiMosiPin = 23;     // VSPI MOSI
+// Display bus (defaults: VSPI / SPI3_HOST). CONFIG_APP_SPI_HOST holds the IDF
+// spi_host_device_t enum value directly (see Kconfig.projbuild).
+static const spi_host_device_t kSpiHost = (spi_host_device_t)CONFIG_APP_SPI_HOST;
+static const int kCsPin = CONFIG_APP_CS_PIN;           // MAX7219 display CS pin
+static const int kMaxDevices = CONFIG_APP_MAX_DEVICES;
+static const int kSpiClockHz = CONFIG_APP_SPI_CLOCK_HZ;
+static const int kSpiMosiPin = CONFIG_APP_SPI_MOSI_PIN;
 static const int kSpiMisoPin = -1;     // Display doesn't need MISO
-static const int kSpiSclkPin = 18;     // VSPI SCLK
+static const int kSpiSclkPin = CONFIG_APP_SPI_SCLK_PIN;
 
 static const char* kTimezone = CONFIG_APP_TZ;
 
@@ -44,7 +44,6 @@ static const int kW5500IntPin = 34;    // W5500 INT pin (GPIO 34 is input-only, 
 static const int kW5500RstPin = 26;    // W5500 RST pin
 
 const char* getNtpServer() { return kNtpServer; }
-int getNtpPort() { return kNtpPort; }
 int getNtpServerPort() { return kNtpServerPort; }
 
 bool getUseDisplay() { 

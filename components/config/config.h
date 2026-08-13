@@ -5,7 +5,6 @@
 
 namespace Config {
 const char* getNtpServer();
-int getNtpPort();
 int getNtpServerPort();
 
 bool getUseDisplay();

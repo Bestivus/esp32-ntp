@@ -84,11 +84,12 @@ config APP_USE_PRESYNC_GLYPH
     depends on APP_USE_DISPLAY
 
 config APP_SPI_HOST
-    int "SPI host device (SPI2_HOST=2, SPI3_HOST=3)"
-    range 1 3
+    int "Display SPI host (IDF enum: 1 = SPI2/HSPI, 2 = SPI3/VSPI)"
+    range 1 2
     default 2
     help
-        ESP32 SPI host: 2 = HSPI, 3 = VSPI.
+        IDF spi_host_device_t value for the display bus. 1 = SPI2_HOST (HSPI),
+        2 = SPI3_HOST (VSPI). The W5500 owns SPI2, so the display defaults to SPI3.
 
 config APP_SPI_MOSI_PIN
     int "SPI MOSI GPIO"
