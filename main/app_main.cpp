@@ -50,6 +50,7 @@ static void display_task(void* arg) {
   int lastDisplayedSecond = -1;
   unsigned long long lastCentiseconds = 0;
   bool wasSynced = false;
+  bool glyphShown = false;
 
   ESP_LOGI(TAG, "Display task started");
 
@@ -71,17 +72,22 @@ static void display_task(void* arg) {
         }
         
         if (!synced) {
-          g_display->clear();
-          g_display->drawPreSyncGlyph();
+          if (!glyphShown) {   /* static image; redraw only on entering the unsynced state */
+            g_display->clear();
+            g_display->drawPreSyncGlyph();
+            g_display->push();
+            glyphShown = true;
+          }
         } else {
+          glyphShown = false;
           if (currentSecond != lastDisplayedSecond) {
             ESP_LOGD(TAG, "Update display: %02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
             g_display->drawTime(timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
             lastDisplayedSecond = currentSecond;
           }
           g_display->drawTopRowFromCentiseconds(centiseconds);
+          g_display->push();
         }
-        g_display->push();
         lastCentiseconds = centiseconds;
         wasSynced = synced;
       }
