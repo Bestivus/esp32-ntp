@@ -204,6 +204,7 @@ typedef struct {
 
 static cfg_val_t s_val[CFG_COUNT];
 static bool s_fdirty[CFG_COUNT];
+static bool s_stored[CFG_COUNT];   /* key exists in NVS rather than tracking the build default */
 static bool s_safe = false;
 static bool s_dirty = false;
 static bool s_provisioned = false;
@@ -252,6 +253,7 @@ void cfg_init(bool safe_mode) {
       if (nvs_get_str(h, f->key, tmp, &len) == ESP_OK) {
         memcpy(s_val[i].s, tmp, len > CFG_STR_MAX ? CFG_STR_MAX : len);
         s_val[i].s[CFG_STR_MAX - 1] = '\0';
+        s_stored[i] = true;
         loaded++;
       }
     } else {
@@ -260,6 +262,7 @@ void cfg_init(bool safe_mode) {
         /* A stored value outside the current range means the schema tightened
          * under it; the default is the safe reading, not the stored one. */
         if (v >= f->imin && v <= f->imax) s_val[i].i = v;
+        s_stored[i] = true;
         loaded++;
       }
     }
@@ -345,12 +348,6 @@ bool cfg_stage(cfg_id_t id, const char* value) {
   return true;
 }
 
-/*
- * Only fields the user actually changed are written, and a save with nothing
- * staged touches flash not at all. Rewriting all 34 keys on every save would
- * burn an NVS page every few saves for no reason; a key left unwritten simply
- * keeps tracking its build-time default, which is the semantic we want anyway.
- */
 bool cfg_clear(cfg_id_t id) {
   if (id >= CFG_COUNT || !is_str(g_cfg_fields[id].type)) return false;
   if (s_val[id].s[0] == '\0') return true;
@@ -360,8 +357,21 @@ bool cfg_clear(cfg_id_t id) {
   return true;
 }
 
+/*
+ * A save pins every field, not just the ones that differ from this build's
+ * defaults. Writing only changed values looks frugal but is wrong: a setting
+ * that happens to equal the current default would never reach flash, and would
+ * then silently flip the first time the device runs firmware built with a
+ * different default. Once a key is in NVS, later saves skip it unless it really
+ * changed, so the cost is one full write on the first save and near nothing
+ * after that.
+ */
 esp_err_t cfg_commit(void) {
-  if (!s_dirty) {
+  bool anyUnpinned = false;
+  for (int i = 0; i < CFG_COUNT; ++i)
+    if (!s_stored[i]) { anyUnpinned = true; break; }
+
+  if (!s_dirty && !anyUnpinned) {
     ESP_LOGI(TAG, "no changes staged, flash untouched");
     return ESP_OK;
   }
@@ -372,7 +382,7 @@ esp_err_t cfg_commit(void) {
 
   int written = 0;
   for (int i = 0; i < CFG_COUNT; ++i) {
-    if (!s_fdirty[i]) continue;
+    if (!s_fdirty[i] && s_stored[i]) continue;
     const cfg_field_t* f = &g_cfg_fields[i];
     if (is_str(f->type)) err = nvs_set_str(h, f->key, s_val[i].s);
     else                 err = nvs_set_i32(h, f->key, s_val[i].i);
@@ -381,6 +391,7 @@ esp_err_t cfg_commit(void) {
       nvs_close(h);
       return err;
     }
+    s_stored[i] = true;
     written++;
   }
   err = nvs_commit(h);
