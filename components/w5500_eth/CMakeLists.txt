@@ -10,8 +10,11 @@ idf_component_register(
     REQUIRES driver esp_driver_gpio esp_netif config efuse esp_timer
 )
 target_compile_definitions(${COMPONENT_LIB} PUBLIC _WIZCHIP_=5500)
-# Disable specific warnings for external library code
-target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-misleading-indentation)
+# Disable specific warnings for external library code. -Wno-missing-field-initializers covers
+# wizchip_conf.c's partial struct initializers (C already zero-fills the rest -- cosmetic, not a
+# real bug), which newer GCC warns on by default; scoped to just this component rather than
+# build-wide so it doesn't mask a real missing-field-initializer bug anywhere else.
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-misleading-indentation -Wno-missing-field-initializers)
 
 # WIZnet's socket.c defines its own close(sn) (for closing W5500 SOCKET
 # handles, unrelated to POSIX file descriptors) and dhcp.c calls it -- both
