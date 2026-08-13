@@ -902,6 +902,10 @@ void NtpStats::renderField(char** pp, char* end, int i) {
       p += snprintf(p, end - p,
         "<input type=password id=\"%s\" name=\"%s\" value=\"\" placeholder=\"%s\">",
         f->key, f->key, cfg_str((cfg_id_t)i)[0] ? "unchanged" : "not set");
+      if (cfg_str((cfg_id_t)i)[0])
+        p += snprintf(p, end - p,
+          "<label class=h><input type=checkbox name=\"%s.clr\" value=\"1\"> remove</label>",
+          f->key);
       break;
     case CF_STR: {
       const char* cur = cfg_str((cfg_id_t)i);
@@ -1018,8 +1022,9 @@ void NtpStats::sendConfigPage(const char* notice) {
   if (Config::isSafeMode())
     p += snprintf(p, end - p,
       "<div class=\"note warn\"><b>Safe mode.</b> Stored settings were ignored this boot "
-      "because the device did not finish starting %d times in a row. These are the "
-      "build-time defaults; saving writes them back and clears the condition.</div>",
+      "because %d starts in a row did not reach the network. These are the build-time "
+      "defaults; your stored values are still in flash, and saving from here overwrites "
+      "them. A restart that reaches the network clears this on its own.</div>",
       CFG_SAFE_MODE_FAILS);
 
   if (cfg_str(CFG_UI_PASS)[0] == '\0')
@@ -1034,9 +1039,9 @@ void NtpStats::sendConfigPage(const char* notice) {
     "<details><summary>Advanced: wiring, pins and timing</summary>"
     "<div class=\"note warn\">These describe how the board is physically wired and how the "
     "clock is calibrated. If you built it to the published wiring, leave them alone. A wrong "
-    "pin here takes the clock off the network on the next restart; hold the RESET button "
-    "through %d start attempts to boot from the build-time defaults and undo it.</div>",
-    CFG_SAFE_MODE_FAILS);
+    "pin here takes the clock off the network on the next restart; interrupt startup twice, "
+    "with RESET or the power lead, and the third boot comes up on the build-time defaults "
+    "so you can undo it.</div>");
   renderSection(&p, end, true);
   p += snprintf(p, end - p, "</details>");
 
@@ -1084,6 +1089,17 @@ void NtpStats::handleConfigPost(const char* body) {
     char* val = eq + 1;
     url_decode(key);
     url_decode(val);
+
+    size_t klen = strlen(key);
+    if (klen > 4 && strcmp(key + klen - 4, ".clr") == 0) {
+      key[klen - 4] = '\0';
+      cfg_id_t cid = cfg_lookup(key);
+      if (cid != CFG_COUNT && strcmp(val, "1") == 0) {
+        cfg_clear(cid);
+        staged++;
+      }
+      continue;
+    }
 
     cfg_id_t id = cfg_lookup(key);
     if (id == CFG_COUNT) continue;

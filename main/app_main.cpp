@@ -205,13 +205,15 @@ void app_main() {
   // pin, or a human pressing RESET repeatedly — serve the defaults instead, so
   // no committed value can put the device beyond reach of its own config page.
   {
-    uint8_t priorFails = cfg_boot_begin();
-    bool safeMode = priorFails >= CFG_SAFE_MODE_FAILS;
+    uint8_t attempt = cfg_boot_begin();
+    bool safeMode = attempt >= CFG_SAFE_MODE_FAILS;
+    ESP_LOGI(TAG, "Start attempt %u since the last start that reached the network",
+             (unsigned)attempt);
     Config::init(safeMode);
     if (safeMode) {
-      ESP_LOGE(TAG, "SAFE MODE after %u incomplete boots: build-time defaults, "
+      ESP_LOGE(TAG, "SAFE MODE on start attempt %u: build-time defaults, "
                     "stored settings ignored until you save from the config page",
-               (unsigned)priorFails);
+               (unsigned)attempt);
     } else if (Config::isProvisioned()) {
       ESP_LOGI(TAG, "Using stored settings from NVS");
     } else {

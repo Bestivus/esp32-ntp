@@ -92,16 +92,21 @@ cfg_id_t cfg_lookup(const char* key);
 /* Validate and stage a value from form input. Returns false and leaves the
  * cached value untouched when the input is out of range or malformed. */
 bool cfg_stage(cfg_id_t id, const char* value);
+/* Force a string field empty. Needed for passwords, where an empty submitted
+ * value means "unchanged" so the form never has to echo the secret back. */
+bool cfg_clear(cfg_id_t id);
 bool cfg_dirty(void);
 
 esp_err_t cfg_commit(void);          /* persist every staged value to NVS */
 esp_err_t cfg_factory_reset(void);   /* erase the namespace entirely      */
 
 /*
- * Boot health, used by the automatic fallback. cfg_boot_begin() counts an
- * attempt and returns how many prior attempts never came up; cfg_boot_healthy()
- * clears it once the device is actually on the network. The counter lives in
- * RTC RAM, never flash, because it moves on every boot.
+ * Boot health, used by the automatic fallback. cfg_boot_begin() returns this
+ * boot's attempt number, counting from 1, and keeps counting until
+ * cfg_boot_healthy() clears it once the device is actually on the network. So
+ * attempt 3 means two earlier starts never reached the network: interrupt
+ * startup twice with RESET or the power lead and the third boot serves
+ * build-time defaults.
  */
 #define CFG_SAFE_MODE_FAILS 3
 

@@ -351,6 +351,15 @@ bool cfg_stage(cfg_id_t id, const char* value) {
  * burn an NVS page every few saves for no reason; a key left unwritten simply
  * keeps tracking its build-time default, which is the semantic we want anyway.
  */
+bool cfg_clear(cfg_id_t id) {
+  if (id >= CFG_COUNT || !is_str(g_cfg_fields[id].type)) return false;
+  if (s_val[id].s[0] == '\0') return true;
+  s_val[id].s[0] = '\0';
+  s_fdirty[id] = true;
+  s_dirty = true;
+  return true;
+}
+
 esp_err_t cfg_commit(void) {
   if (!s_dirty) {
     ESP_LOGI(TAG, "no changes staged, flash untouched");
@@ -397,34 +406,41 @@ esp_err_t cfg_factory_reset(void) {
 }
 
 /*
- * Boot health lives in RTC RAM, deliberately not in flash. This counter moves
- * on every single boot, and a device that reboots on watchdog or power glitches
- * would otherwise grind an NVS page for nothing. RTC_NOINIT survives software,
- * panic and watchdog resets, which is exactly the set of events that indicate a
- * bad config, and is garbage after a cold power-up, which the magic check reads
- * as a fresh start.
+ * Boot health is one byte in NVS. RTC RAM was tried first and is wrong for the
+ * job: on the ESP32 the EN/RESET line is a power-on-class reset that clears the
+ * RTC domain (measured, esp_reset_reason() reports ESP_RST_POWERON), so the
+ * counter never advanced across the button presses that are the whole point of
+ * a manual recovery.
  *
- * The same counter serves both recovery paths: a config that crashes or never
- * reaches the network trips it on its own, and a human can trip it deliberately
- * by pressing RESET three times before the device finishes coming up. Note this
- * is the reset button, not the power lead: a full power cycle clears RTC RAM.
+ * The cost is two byte writes per boot, one to count the attempt and one to
+ * clear it once the network is up. NVS wear-levels those across the partition
+ * at roughly 126 entries per 4 KB page, so a page erase lands about every 63
+ * boots; against ~100k erases per sector that is tens of millions of boots.
+ * The write that actually needed avoiding was rewriting all of the settings on
+ * every save, and cfg_commit() only touches keys that changed.
  */
-#define BOOT_MAGIC 0x4E545030u   /* "NTP0" */
-
-RTC_NOINIT_ATTR static uint32_t s_rtc_magic;
-RTC_NOINIT_ATTR static uint32_t s_rtc_fails;
+#define BOOT_KEY "boot.fail"
 
 uint8_t cfg_boot_begin(void) {
-  if (s_rtc_magic != BOOT_MAGIC) {
-    s_rtc_magic = BOOT_MAGIC;
-    s_rtc_fails = 0;
-    return 0;
-  }
-  uint32_t prior = s_rtc_fails;
-  if (s_rtc_fails < 255) s_rtc_fails++;
-  return (uint8_t)prior;
+  nvs_handle_t h;
+  if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return 1;
+  uint8_t n = 0;
+  nvs_get_u8(h, BOOT_KEY, &n);
+  if (n < 255) n++;
+  nvs_set_u8(h, BOOT_KEY, n);
+  nvs_commit(h);
+  nvs_close(h);
+  return n;
 }
 
 void cfg_boot_healthy(void) {
-  s_rtc_fails = 0;
+  nvs_handle_t h;
+  if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+  uint8_t n = 0;
+  nvs_get_u8(h, BOOT_KEY, &n);
+  if (n != 0) {
+    nvs_set_u8(h, BOOT_KEY, 0);
+    nvs_commit(h);
+  }
+  nvs_close(h);
 }
