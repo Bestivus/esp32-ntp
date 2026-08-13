@@ -92,7 +92,9 @@ algorithm against three independent clocks rather than by a one-off measurement 
   <img src="docs/esp32-ntp-wiring.svg" alt="ESP32 stratum-1 NTP signal wiring: u-blox NEO-6M GPS (NMEA over UART, PPS into GPIO19 captured by MCPWM), and the WIZnet W5500 over SPI with INTn on GPIO34 for hardware RX timestamping. The two hardware-timestamped nets, PPS and INTn, are in coral." width="720">
 </p>
 
-- **MCU:** ESP32 (IDF target `esp32`).
+- **MCU:** ESP32 (IDF target `esp32`). The build pins the crystal at 40 MHz (`CONFIG_XTAL_FREQ`);
+  some modules ship with a 26 MHz crystal instead, and the tell is garbage on the serial console at
+  115200. If that's your board, change `CONFIG_XTAL_FREQ` in `menuconfig`.
 - **GPS:** any UART NMEA module with a PPS output (for example NEO-6M, NEO-M8N, or NEO-M9N). PPS
   goes to any GPIO, including input-only pins 34 to 39, because it's captured by the MCPWM
   peripheral.
