@@ -25,9 +25,8 @@ Home Assistant (Part 6) also confirmed working end-to-end against a real EMQX br
   - **Confirmed baud: 9600** (not the 38400 SparkFun documents as default — this specific module's
     saved config differs from factory default; already correctly hardcoded in `config.cpp`, not a
     bug)
-- Network: static IP planned for final deployment (10.100.0.40, Lab VLAN); currently burning in
-  on DHCP on a different subnet (10.10.0.0/24) for testing, since that's the only reachable
-  network with console access
+- Network: static IP planned for final deployment (Lab VLAN); currently burning in on DHCP on a
+  separate testing subnet, since that's the only reachable network with console access
 
 All wiring independently validated working via standalone Arduino test sketches before any
 ESP-IDF firmware work began — hardware was never in question at any point in the debugging below.
