@@ -34,6 +34,10 @@ self-contained one that runs directly on an ESP32.
   off.
 - **Ethernet or Wi-Fi.** WIZnet W5500 (SPI) or Wi-Fi STA, selected at build time. Same NTP server
   and metrics either way.
+- **Settings in flash, edited from a browser.** Network, timezone, display and every wiring pin are
+  stored in NVS and changed from a page the device serves itself, no rebuild and no serial cable.
+  Risky settings are gated, values are validated before they are written, and interrupting startup
+  twice brings the third boot up on the build-time defaults if a change ever locks you out.
 - **Prometheus metrics over HTTP** at `GET /metrics`: lock state, offset, jitter, frequency, and a
   full set of health and diagnostics counters.
 - **Self-healing for unattended use.** A hardware watchdog reboots on any firmware hang, and a
@@ -152,6 +156,43 @@ Or call `idf.py` directly if you prefer.
 
 ## Configuration
 
+Settings live in flash and are edited from the device's own web page. Everything below can also be
+set at build time in `menuconfig`, and those build-time values are what an unconfigured device runs
+on, so a freshly flashed board comes up exactly as it always did.
+
+### Settings page
+
+Point a browser at the device on the management port (`8080` by default):
+
+```
+http://<device-ip>:8080/
+```
+
+Everyday settings are on the page directly: network interface, DHCP or a static address, timezone
+(a dropdown of common zones, not a raw POSIX string), the display toggles, the management port, and
+an optional password. Wiring settings — every GPIO, SPI host, SPI clock, the GPS UART and the PPS
+pin — sit behind an **Advanced** disclosure, because a wrong pin there takes the clock off the
+network on the next restart.
+
+Saving writes only the fields you changed and reboots. Values are validated before anything reaches
+flash, so an out-of-range pin or a malformed IP is refused with nothing written. Fields marked `*`
+need the restart to take effect.
+
+Set a password under **System** unless the network is fully trusted: without one, anyone who can
+reach the address can reconfigure or reboot the clock. `/metrics` stays unauthenticated either way
+so Prometheus can scrape it.
+
+### If a setting makes the device unreachable
+
+Interrupt startup twice, with the reset button or the power lead. The third boot ignores stored
+settings and comes up on the build-time defaults, with a banner on the settings page explaining
+why. Your stored values are still in flash and are not touched; saving from that page overwrites
+them, and any restart that reaches the network clears the condition on its own.
+
+**Erase stored settings** at the bottom of the page wipes everything back to build-time defaults.
+
+### Build-time defaults
+
 Project options live under **`esp32-ntp configuration`** in `menuconfig`:
 
 - **Network**
@@ -169,8 +210,9 @@ Project options live under **`esp32-ntp configuration`** in `menuconfig`:
   - `APP_USE_DISPLAY` and the MAX7219 SPI host/pinout (`APP_SPI_HOST`, `APP_SPI_MOSI_PIN`,
     `APP_SPI_SCLK_PIN`, `APP_CS_PIN`, `APP_MAX_DEVICES`, `APP_SPI_CLOCK_HZ`).
 
-Ethernet and GPS pin assignments are in `Config::getW5500*` and `Config::getGps*` in
-`components/config/config.cpp`.
+The full set of runtime settings, their valid ranges and their build-time defaults are declared in
+one table in `components/config/config_store.c`; adding a setting means adding a row there, and the
+settings page renders and parses itself from it.
 
 ## Runtime behavior
 
