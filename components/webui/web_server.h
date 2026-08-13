@@ -8,9 +8,9 @@ class NtpServer;
 class W5500Eth;
 class WifiSta;
 
-class NtpStats {
+class WebServer {
 public:
-  NtpStats();
+  WebServer();
   esp_err_t begin(int port, GpsDiscipline* gps, NtpServer* ntp, W5500Eth* eth, WifiSta* wifi);
   void loop();
 

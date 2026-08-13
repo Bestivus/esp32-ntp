@@ -23,7 +23,7 @@
 #include "gps.h"
 #include "esp_task_wdt.h"
 #include "ntp_server.h"
-#include "ntp_stats.h"
+#include "web_server.h"
 #include "w5500_eth.h"
 #include "wifi_sta.h"
 
@@ -32,7 +32,7 @@ static const char* TAG = "APP";
 static Display* g_display = nullptr;
 static GpsDiscipline* g_gps = nullptr;
 static NtpServer* g_ntpServer = nullptr;
-static NtpStats* g_ntpStats = nullptr;
+static WebServer* g_web = nullptr;
 static W5500Eth* g_ethernet = nullptr;
 static WifiSta* g_wifi = nullptr;
 static SemaphoreHandle_t g_displayMutex = nullptr;
@@ -153,7 +153,7 @@ static void ntp_task(void* arg) {
       lastHouse = nowMs;
       if (g_ethernet) g_ethernet->loop();
       if (g_wifi) g_wifi->loop();
-      if (g_ntpStats) g_ntpStats->loop();
+      if (g_web) g_web->loop();
       unsigned long now = esp_timer_get_time() / 1000000ULL;
       if (now - lastLog >= 60) {
         struct timeval tv2; struct tm ti2;
@@ -345,8 +345,8 @@ void app_main() {
     }, nullptr);
   }
 
-  g_ntpStats = new NtpStats();
-  g_ntpStats->begin(Config::getStatsPort(), g_gps, g_ntpServer, g_ethernet, g_wifi);
+  g_web = new WebServer();
+  g_web->begin(Config::getStatsPort(), g_gps, g_ntpServer, g_ethernet, g_wifi);
   gettimeofday(&tv, nullptr);
   struct tm timeinfo;
   localtime_r(&tv.tv_sec, &timeinfo);

@@ -264,7 +264,9 @@ cable.
   rejection).
 - `components/ntp_server`: NTP server over W5500 UDP or Wi-Fi UDP, with hardware RX timestamping and
   transmit-timestamp correction.
-- `components/ntp_stats`: HTTP `/metrics` server over W5500 TCP or Wi-Fi TCP.
+- `components/webui`: the HTTP server the device runs on itself. `web_server.cpp` is transport,
+  request assembly, routing and auth; `web_metrics.cpp` renders `/metrics`; `web_config.cpp`
+  renders and parses the settings page.
 - `components/w5500_eth`: W5500 SPI driver, DHCP/static IP, PHY setup, and the link/health watchdog.
 - `components/wifi_sta`: Wi-Fi STA with DHCP or static IP.
 - `components/w5k`: latency-tuned UDP/TCP wrappers over the W5500 driver for the NTP reply path.

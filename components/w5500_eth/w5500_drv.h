@@ -118,7 +118,7 @@ int      w5500_tcp_listen(uint8_t sn, uint16_t port);   /* 0 ok, -1 open failed,
 int32_t  w5500_tcp_recv(uint8_t sn, uint8_t* buf, uint16_t len);
 /* Returns len once staged, 0 while the previous chunk is unacknowledged or
  * the TX buffer lacks room (never spins on the peer), <0 when the connection
- * is gone. ntp_stats is built around the 0-means-retry contract. */
+ * is gone. webui is built around the 0-means-retry contract. */
 int32_t  w5500_tcp_send(uint8_t sn, const uint8_t* buf, uint16_t len);
 int      w5500_tcp_discon(uint8_t sn);
 
