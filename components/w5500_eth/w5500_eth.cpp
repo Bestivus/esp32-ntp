@@ -238,6 +238,16 @@ static void IRAM_ATTR w5k_fifo_xfer(uint16_t total, bool want_rx) {
 
   spi_ll_clear_int_stat(hw);
   spi_ll_user_start(hw);
+  /*
+   * Deliberately unbounded. If this spin ever fails to complete, the SPI
+   * peripheral is wedged and there is no correct value to salvage: a bounded
+   * fallback would hand whatever is in the RX FIFO to the caller as if it
+   * were a real transfer, and a time server that serves bad time is worse
+   * than one that is briefly absent. Starving here trips the task watchdog,
+   * which is configured to panic-reboot (ESP_TASK_WDT_PANIC): the device
+   * dies loudly and comes back clean, and NTP clients are built for sources
+   * that vanish, not sources that lie. Do not "fix" this with a timeout.
+   */
   while (!spi_ll_usr_is_done(hw)) { }
 
   if (want_rx) spi_ll_read_buffer(hw, s_fast_rx, bits);
