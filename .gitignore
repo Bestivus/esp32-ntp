@@ -15,7 +15,10 @@
 __pycache__/
 *.pyc
 
-# ESP-IDF generated files we don't track
+# ESP-IDF generated files we don't track -- sdkconfig carries real local
+# network settings (static IP, NTP server), so it stays local-only rather
+# than being committed to this public fork.
+/sdkconfig
 /sdkconfig.old
 
 # Logs
