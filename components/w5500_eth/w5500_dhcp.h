@@ -30,6 +30,11 @@ uint32_t w5500_dhcp_acks_total(void);
 uint32_t w5500_dhcp_naks_total(void);
 uint32_t w5500_dhcp_timeouts_total(void);
 uint32_t w5500_dhcp_renews_total(void);
+/* Restarts that reclaimed the cached lease instead of rediscovering. */
+uint32_t w5500_dhcp_reclaims_total(void);
+
+/* Drop the cached lease so the next start runs a full discovery. */
+void w5500_dhcp_forget(void);
 
 #ifdef __cplusplus
 }

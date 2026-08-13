@@ -8,6 +8,7 @@
 #include "w5500_drv.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "nvs.h"
 #include <string.h>
 
 static const char* TAG = "W5500DHCP";
@@ -44,7 +45,7 @@ static const uint8_t MAGIC_COOKIE[4] = { 99, 130, 83, 99 };
 static const uint8_t BCAST_IP[4] = { 255, 255, 255, 255 };
 static const char HOSTNAME[] = "esp32-ntp";
 
-/* per-phase retry budget: resend after 4 s, three sends per phase */
+/* per-phase retry budget: three sends per phase, backing off 1 s, 2 s, then 4 s */
 #define PHASE_TIMEOUT_S 4
 #define PHASE_RETRIES   3
 /* renew/rebind REQUEST pacing */
@@ -54,6 +55,7 @@ typedef enum {
   ST_INIT = 0,
   ST_SELECTING,    /* DISCOVER sent, waiting for OFFER  */
   ST_REQUESTING,   /* REQUEST sent, waiting for ACK/NAK */
+  ST_REBOOTING,    /* cached lease reclaimed, waiting for ACK/NAK */
   ST_LEASED,
   ST_RENEWING,     /* past T1, unicast REQUEST to server */
   ST_REBINDING,    /* past T2, broadcast REQUEST         */
@@ -75,9 +77,68 @@ static uint32_t s_t1 = 0, s_t2 = 0;   /* absolute, in s_ticks time */
 static uint32_t s_lease_end = 0;
 static uint32_t s_bound_at = 0;
 
+static uint8_t s_gw[4], s_mask[4];
+
 static uint32_t s_acks = 0, s_naks = 0, s_timeouts = 0, s_renews = 0;
+static uint32_t s_reclaims = 0;
 
 static uint8_t s_msg[DHCP_MSG_SIZE];
+
+/*
+ * The bound lease is cached in flash so a restart can reclaim the address it
+ * already had (RFC 2131 INIT-REBOOT) instead of running a full discovery. Two
+ * things fall out of that: the network is up in one exchange rather than four,
+ * and a restart while the DHCP server is unreachable still comes back on the
+ * last known-good address rather than a hardcoded fallback.
+ *
+ * Writes are rare by construction. The cache is only rewritten when the bound
+ * values actually change, so the renewals that dominate a lease's life (every
+ * T1, and they return the same address) never touch flash at all.
+ */
+#define LEASE_NS "dhcplease"
+
+/*
+ * Deliberately no lease duration here. Servers that hand out the remaining time
+ * on a reservation return a different value on every bind, so caching it would
+ * make the comparison below always differ and write flash on every boot and
+ * every renewal. Reclaiming needs only the address and who to ask; the duration
+ * comes back in the ACK a moment later.
+ */
+typedef struct {
+  uint8_t ip[4], gw[4], mask[4], sid[4];
+} lease_cache_t;
+
+static bool lease_load(lease_cache_t* out) {
+  nvs_handle_t h;
+  if (nvs_open(LEASE_NS, NVS_READONLY, &h) != ESP_OK) return false;
+  size_t n = sizeof(*out);
+  esp_err_t err = nvs_get_blob(h, "lease", out, &n);
+  nvs_close(h);
+  if (err != ESP_OK || n != sizeof(*out)) return false;
+  if (!(out->ip[0] | out->ip[1] | out->ip[2] | out->ip[3])) return false;
+  return true;
+}
+
+static void lease_save(const lease_cache_t* in) {
+  lease_cache_t cur;
+  if (lease_load(&cur) && memcmp(&cur, in, sizeof(cur)) == 0) return;
+  nvs_handle_t h;
+  if (nvs_open(LEASE_NS, NVS_READWRITE, &h) != ESP_OK) return;
+  if (nvs_set_blob(h, "lease", in, sizeof(*in)) == ESP_OK) nvs_commit(h);
+  nvs_close(h);
+  ESP_LOGI(TAG, "cached lease %d.%d.%d.%d for the next restart",
+           in->ip[0], in->ip[1], in->ip[2], in->ip[3]);
+}
+
+void w5500_dhcp_forget(void) {
+  nvs_handle_t h;
+  if (nvs_open(LEASE_NS, NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_erase_all(h);
+  nvs_commit(h);
+  nvs_close(h);
+}
+
+uint32_t w5500_dhcp_reclaims_total(void) { return s_reclaims; }
 
 uint32_t w5500_dhcp_lease_seconds(void) { return s_lease_secs; }
 uint32_t w5500_dhcp_acks_total(void)     { return s_acks; }
@@ -87,12 +148,33 @@ uint32_t w5500_dhcp_renews_total(void)   { return s_renews; }
 
 void w5500_dhcp_tick_1s(void) { s_ticks++; }
 
+static void send_request(void);
+
 void w5500_dhcp_init(uint8_t sn) {
   s_sn = sn;
   w5500_get_mac(s_mac);
   s_xid = esp_random();
-  s_phase = ST_INIT;
   s_retries = 0;
+
+  lease_cache_t c;
+  if (lease_load(&c)) {
+    /* INIT-REBOOT. The address is programmed before the server has confirmed
+     * anything, which is what makes a restart during a DHCP outage survivable;
+     * a NAK below gives it straight back. */
+    memcpy(s_lease_ip, c.ip, 4);
+    memcpy(s_gw, c.gw, 4);
+    memcpy(s_mask, c.mask, 4);
+    memcpy(s_server_id, c.sid, 4);
+    w5500_set_ipconf(s_lease_ip, s_gw, s_mask);
+    s_phase = ST_REBOOTING;
+    w5500_udp_open(s_sn, DHCP_CLIENT_PORT);
+    ESP_LOGI(TAG, "reclaiming cached lease %d.%d.%d.%d",
+             s_lease_ip[0], s_lease_ip[1], s_lease_ip[2], s_lease_ip[3]);
+    send_request();
+    return;
+  }
+
+  s_phase = ST_INIT;
   /* RFC 2131 INIT: discover from 0.0.0.0, so a link bounce onto a different
    * subnet reacquires instead of squatting on the stale lease. */
   static const uint8_t zero[4] = {0, 0, 0, 0};
@@ -166,6 +248,11 @@ static void send_request(void) {
     memcpy(&s_msg[k], s_offered_ip, 4); k += 4;
     s_msg[k++] = OPT_SERVER_ID; s_msg[k++] = 4;
     memcpy(&s_msg[k], s_server_id, 4); k += 4;
+  } else if (s_phase == ST_REBOOTING) {
+    /* RFC 2131 4.3.2: requested-IP carries the address, ciaddr stays zero and
+     * no server identifier is sent, so any server on the segment may answer. */
+    s_msg[k++] = OPT_REQUESTED_IP; s_msg[k++] = 4;
+    memcpy(&s_msg[k], s_lease_ip, 4); k += 4;
   }
   finish_and_send(k, s_phase == ST_RENEWING ? s_server_id : BCAST_IP);
 }
@@ -228,6 +315,8 @@ static w5500_dhcp_state_t bind_lease(const reply_t* r) {
   if (r->has_mask) memcpy(mask, r->mask, 4);
   if (r->has_router) memcpy(gw, r->router, 4);
   w5500_set_ipconf(s_lease_ip, gw, mask);
+  memcpy(s_gw, gw, 4);
+  memcpy(s_mask, mask, 4);
 
   s_lease_secs = r->lease ? r->lease : 3600;
   s_bound_at = s_ticks;
@@ -241,8 +330,27 @@ static w5500_dhcp_state_t bind_lease(const reply_t* r) {
   s_phase = ST_LEASED;
   s_retries = 0;
   s_acks++;
+
+  lease_cache_t c;
+  memcpy(c.ip, s_lease_ip, 4);
+  memcpy(c.gw, s_gw, 4);
+  memcpy(c.mask, s_mask, 4);
+  memcpy(c.sid, s_server_id, 4);
+  lease_save(&c);
+
   return changed ? W5500_DHCP_CHANGED
                  : (first ? W5500_DHCP_ASSIGNED : W5500_DHCP_LEASED);
+}
+
+/*
+ * The first frame after link-up is routinely lost while the switch port
+ * settles, so a flat 4 s retry means every cold start pays 4 s to notice.
+ * Retry quickly once, then back off to the RFC-ish pacing.
+ */
+static uint32_t phase_timeout(void) {
+  if (s_retries == 0) return 1;
+  if (s_retries == 1) return 2;
+  return PHASE_TIMEOUT_S;
 }
 
 static void restart_discovery(void) {
@@ -316,7 +424,7 @@ w5500_dhcp_state_t w5500_dhcp_run(void) {
         send_request();
         return W5500_DHCP_RUNNING;
       }
-      if (s_ticks - s_phase_sent_at >= PHASE_TIMEOUT_S) {
+      if (s_ticks - s_phase_sent_at >= phase_timeout()) {
         s_timeouts++;
         if (++s_retries >= PHASE_RETRIES) { restart_discovery(); return W5500_DHCP_FAILED; }
         send_discover();
@@ -337,9 +445,38 @@ w5500_dhcp_state_t w5500_dhcp_run(void) {
         return bind_lease(&ack);
       }
       if (got_nak) { s_naks++; drop_lease(); restart_discovery(); return W5500_DHCP_RUNNING; }
-      if (s_ticks - s_phase_sent_at >= PHASE_TIMEOUT_S) {
+      if (s_ticks - s_phase_sent_at >= phase_timeout()) {
         s_timeouts++;
         if (++s_retries >= PHASE_RETRIES) { restart_discovery(); return W5500_DHCP_FAILED; }
+        send_request();
+      }
+      return W5500_DHCP_RUNNING;
+
+    case ST_REBOOTING:
+      if (got_ack) {
+        s_reclaims++;
+        return bind_lease(&ack);
+      }
+      /* The server no longer agrees this address is ours. Give it back before
+       * rediscovering, since it may already belong to someone else. */
+      if (got_nak) {
+        s_naks++;
+        ESP_LOGW(TAG, "cached lease rejected, rediscovering");
+        w5500_dhcp_forget();
+        drop_lease();
+        restart_discovery();
+        return W5500_DHCP_RUNNING;
+      }
+      if (s_ticks - s_phase_sent_at >= phase_timeout()) {
+        s_timeouts++;
+        if (++s_retries >= PHASE_RETRIES) {
+          /* Nobody answered. Keep running on the cached address, which is the
+           * whole point of caching it, and fall back to a full discovery. */
+          ESP_LOGW(TAG, "no answer reclaiming the lease, keeping the address "
+                        "and falling back to discovery");
+          restart_discovery();
+          return W5500_DHCP_RUNNING;
+        }
         send_request();
       }
       return W5500_DHCP_RUNNING;

@@ -392,6 +392,7 @@ void WebServer::handleConnection() {
       return;
     }
     cfg_factory_reset();
+    w5500_dhcp_forget();
     sendStatus("200 OK", "text/plain",
                "Settings erased. Rebooting into build-time defaults.");
     vTaskDelay(pdMS_TO_TICKS(250));

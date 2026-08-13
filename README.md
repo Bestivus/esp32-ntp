@@ -220,6 +220,15 @@ On boot, `app_main` initializes NVS, brings up the selected network interface (W
 DHCP or static IP, applies the timezone, optionally starts the display task, and then starts GPS/PPS
 disciplining, the NTP server, and the stats HTTP server.
 
+**DHCP** on the W5500 path caches the bound lease in flash and reclaims it on the next start
+(RFC 2131 INIT-REBOOT) rather than rediscovering from scratch. The address is programmed before the
+server confirms it, so a restart while the DHCP server is unreachable still comes back on the last
+known-good address instead of a fallback; a NAK hands it straight back and triggers a full
+discovery. Only the address, gateway, netmask and server identity are cached, and only rewritten
+when those change, so renewals never touch flash. Time from link-up to a usable address is about a
+second, since the first frame after link-up is routinely lost while the switch port settles and the
+retry backs off 1 s, 2 s, then 4 s rather than waiting 4 s to notice.
+
 **NTP server** (UDP port 123):
 - Synthesizes NTP timestamps from the last PPS edge plus a frequency-corrected monotonic timer.
 - On the W5500 path: timestamps the request on arrival via the `INTn` interrupt, resolves ARP up

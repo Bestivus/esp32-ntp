@@ -26,7 +26,6 @@
 #include "lwip/sockets.h"
 
 
-static const char* TAG = "WEBUI";
 extern volatile uint32_t g_mainLoopBeats;
 extern uint32_t g_bootCount;
 
@@ -159,6 +158,9 @@ void WebServer::sendMetrics() {
     "# HELP ntp_dhcp_renews_total Unicast renewal REQUESTs sent at T1\n"
     "# TYPE ntp_dhcp_renews_total counter\n"
     "ntp_dhcp_renews_total %" PRIu32 "\n"
+    "# HELP ntp_dhcp_reclaims_total Restarts that reclaimed the cached lease instead of rediscovering\n"
+    "# TYPE ntp_dhcp_reclaims_total counter\n"
+    "ntp_dhcp_reclaims_total %" PRIu32 "\n"
     "# HELP ntp_gps_fix_quality GGA fix quality (0 none, 1 GPS, 2 DGPS, 4 RTK fix, 5 RTK float)\n"
     "# TYPE ntp_gps_fix_quality gauge\n"
     "ntp_gps_fix_quality %d\n"
@@ -278,6 +280,7 @@ void WebServer::sendMetrics() {
     w5500_dhcp_naks_total(),
     w5500_dhcp_timeouts_total(),
     w5500_dhcp_renews_total(),
+    w5500_dhcp_reclaims_total(),
 
     gs.fixQuality,
     gs.fixType,
