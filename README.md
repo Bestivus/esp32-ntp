@@ -37,8 +37,10 @@ self-contained one that runs directly on an ESP32.
   the same source builds everywhere.
 - **Settings in flash, edited from a browser.** Network, timezone, display and every wiring pin are
   stored in NVS and changed from a page the device serves itself, no rebuild and no serial cable.
-  Risky settings are gated, values are validated before they are written, and interrupting startup
-  twice brings the third boot up on the build-time defaults if a change ever locks you out.
+  Risky settings are gated behind a disclosure, values are validated before they are written, and
+  interrupting startup twice brings the third boot up on the build-time defaults if a change ever
+  locks you out. When you are done configuring, the settings page can be **fused off for good**, so
+  a deployed clock exposes nothing but NTP and metrics.
 - **Prometheus metrics over HTTP** at `GET /metrics`: lock state, offset, jitter, frequency, and a
   full set of health and diagnostics counters.
 - **Self-healing for unattended use.** A hardware watchdog reboots on any firmware hang, and a
@@ -160,13 +162,14 @@ Street prices for the clone-grade parts most people actually buy (AliExpress / H
 | Part | Role | Typical price |
 | --- | --- | --- |
 | ESP32 DevKitC / WROOM-32 dev board | MCU, MCPWM capture, servo | $5 |
-
-The MCU row means the original ESP32 specifically. See **Hardware** above for which parts in the family can and cannot run this, and why.
 | NEO-6M GPS module + ceramic antenna | GPS fix and the PPS edge | $6 |
 | WIZnet W5500 module (RJ45 + magnetics) | wired Ethernet, hardware timestamping | $7 |
 | Jumper wires / small perfboard | wiring | $2 |
 | 5V USB supply | power (you probably already own one) | $0 to $3 |
 | MAX7219 4-in-1 8x8 matrix (optional) | LED display | $6 |
+
+The MCU row means the original ESP32 specifically. See **Hardware** above for which parts in the
+family can and cannot run this, and why.
 
 That is about **$20 for the Ethernet Stratum 1**, or roughly **$26 with the display**. The NEO-6M is
 the cheapest module with a PPS pin, which is what makes the $20 number real. A NEO-M8N (around $15)
@@ -229,6 +232,32 @@ need the restart to take effect.
 Set a password under **System** unless the network is fully trusted: without one, anyone who can
 reach the address can reconfigure or reboot the clock. `/metrics` stays unauthenticated either way
 so Prometheus can scrape it.
+
+### Locking it down
+
+Once a clock is configured and in service, the settings page is pure attack surface. Two controls,
+in increasing severity:
+
+**Password.** Set one under **System**. It applies to the settings page only; `/metrics` stays open
+so Prometheus can scrape without credentials.
+
+**Lock settings permanently.** A fuse. Saving it removes the settings page, `GET /` and
+`/config` and `POST /config` all answer `403`, and so does `/factory-reset`, because a reset that
+cleared the lock would not be a lock. What survives is NTP on port 123 and `/metrics`, which is
+everything a deployed clock actually needs.
+
+It is one way. Nothing over the network undoes it, and neither does the safe-mode path below: safe
+mode reads the lock straight out of NVS rather than from the settings it is ignoring, so a bad
+config still recovers while the page stays shut. The only way back is physical, erasing the NVS
+partition over USB:
+
+```bash
+esptool --port /dev/ttyUSB0 erase-region 0x9000 0x6000
+```
+
+That takes every stored setting with it and the device returns to build-time defaults. Locking
+requires a password to be set first: without one, anyone who could reach the page could fuse it
+shut and lock you out of your own clock.
 
 ### If a setting makes the device unreachable
 

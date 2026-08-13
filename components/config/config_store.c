@@ -122,6 +122,11 @@ const cfg_field_t g_cfg_fields[CFG_COUNT] = {
                        .help="This page and /metrics.", .reboot=true },
   [CFG_UI_PASS]    = { .key="ui.pass", .label="Management password", .group="System", .type=CF_PASS,
                        .sdef="", .help="Blank leaves this page open to anyone on the network." },
+  [CFG_UI_LOCK]    = { .key="ui.lock", .label="Lock settings permanently", .group="System", .type=CF_BOOL,
+                       .imin=0, .imax=1, .idef=0,
+                       .help="One way. Saving this removes the settings page for good; only erasing "
+                             "the NVS partition over USB brings it back. Metrics keep working. "
+                             "Requires a password to be set." },
 
   [CFG_DISP_EN]    = { .key="disp.en", .label="Enable display", .group="Display", .type=CF_BOOL,
                        .imin=0, .imax=1, .idef=DEF_DISP_EN, .reboot=true },
@@ -316,6 +321,9 @@ bool cfg_stage(cfg_id_t id, const char* value) {
   if (id >= CFG_COUNT || !value) return false;
   const cfg_field_t* f = &g_cfg_fields[id];
 
+  if (id == CFG_UI_LOCK && value[0] == '1' && s_val[CFG_UI_PASS].s[0] == '\0')
+    return false;
+
   if (is_str(f->type)) {
     if (strlen(value) >= CFG_STR_MAX) return false;
     if (id == CFG_NET_IP || id == CFG_NET_GW || id == CFG_NET_MASK) {
@@ -399,6 +407,15 @@ esp_err_t cfg_factory_reset(void) {
   nvs_close(h);
   if (err == ESP_OK) ESP_LOGW(TAG, "settings erased, reverting to build defaults");
   return err;
+}
+
+bool cfg_locked(void) {
+  nvs_handle_t h;
+  if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+  int32_t v = 0;
+  esp_err_t err = nvs_get_i32(h, g_cfg_fields[CFG_UI_LOCK].key, &v);
+  nvs_close(h);
+  return err == ESP_OK && v != 0;
 }
 
 #define BOOT_KEY "boot.fail"

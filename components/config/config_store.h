@@ -23,6 +23,7 @@ typedef enum {
   CFG_NTP_PORT,
   CFG_STATS_PORT,
   CFG_UI_PASS,
+  CFG_UI_LOCK,
   CFG_DISP_EN,
   CFG_DISP_GLYPH,
   CFG_DISP_HOST,
@@ -86,6 +87,10 @@ bool cfg_dirty(void);
 
 esp_err_t cfg_commit(void);          /* persist every staged value to NVS */
 esp_err_t cfg_factory_reset(void);   /* erase the namespace entirely      */
+
+/* Read straight from NVS, deliberately ignoring safe mode: the lock is a fuse,
+ * so booting on build-time defaults must not hand the settings page back. */
+bool cfg_locked(void);
 
 #define CFG_SAFE_MODE_FAILS 3
 

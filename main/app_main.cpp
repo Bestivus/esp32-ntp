@@ -212,6 +212,8 @@ void app_main() {
       ESP_LOGE(TAG, "SAFE MODE on start attempt %u: build-time defaults, "
                     "stored settings ignored until you save from the config page",
                (unsigned)attempt);
+    } else if (cfg_locked()) {
+      ESP_LOGW(TAG, "Settings are locked; the config page is disabled");
     } else if (Config::isProvisioned()) {
       ESP_LOGI(TAG, "Using stored settings from NVS");
     } else {

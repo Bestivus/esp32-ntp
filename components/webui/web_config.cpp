@@ -269,6 +269,7 @@ void WebServer::handleConfigPost(char* body) {
   char* buf = body;
 
   char bad[64] = {0};
+  cfg_id_t badId = CFG_COUNT;
   int staged = 0;
 
   char* saveptr = nullptr;
@@ -296,15 +297,21 @@ void WebServer::handleConfigPost(char* body) {
     if (id == CFG_COUNT) continue;
     if (!cfg_stage(id, val)) {
       snprintf(bad, sizeof(bad), "%s", g_cfg_fields[id].label);
+      badId = id;
       break;
     }
     staged++;
   }
 
   if (bad[0]) {
-    char msg[160];
-    snprintf(msg, sizeof(msg),
-             "Rejected: %s is out of range. Nothing was written.", bad);
+    char msg[220];
+    if (badId == CFG_UI_LOCK)
+      snprintf(msg, sizeof(msg),
+               "Rejected: set a management password before locking settings, "
+               "otherwise anyone on this network could lock you out. Nothing was written.");
+    else
+      snprintf(msg, sizeof(msg),
+               "Rejected: %s is out of range. Nothing was written.", bad);
     sendStatus("400 Bad Request", "text/plain", msg);
     return;
   }

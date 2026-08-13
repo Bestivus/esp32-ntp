@@ -367,6 +367,13 @@ void WebServer::handleConnection() {
     return;
   }
 
+  if (cfg_locked() && (pathIs("/") || pathIs("/config") || pathIs("/factory-reset"))) {
+    sendStatus("403 Forbidden", "text/plain",
+      "Settings are locked on this device. The lock is one way: erase the NVS "
+      "partition over USB to undo it. Metrics remain available at /metrics.");
+    return;
+  }
+
   if (isGet && (pathIs("/") || pathIs("/config"))) {
     if (!authorized(req)) {
       sendStatus("401 Unauthorized", "text/plain", "Authentication required");
