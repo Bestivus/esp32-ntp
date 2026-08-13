@@ -15,9 +15,11 @@ config APP_NETWORK_WIZNET
 
 config APP_NETWORK_WIFI
     bool "WiFi STA"
-    depends on IDF_TARGET_ESP32
+    depends on SOC_WIFI_SUPPORTED
     help
-        Use ESP32 WiFi station with DHCP. NTP and stats work the same as over Ethernet.
+        Use WiFi station with DHCP. NTP and stats work the same as over Ethernet.
+        Only offered on parts that have a radio; the W5500 Ethernet path works
+        everywhere.
 
 endchoice
 

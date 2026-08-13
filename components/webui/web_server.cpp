@@ -34,6 +34,15 @@ char g_req[3072];
 char g_resp[26624];
 const int hdrReserve = 128;
 
+static bool wifi_ip(WifiSta* w, uint32_t& ip) {
+#if CONFIG_SOC_WIFI_SUPPORTED
+  return w && w->getIpAddr(ip);
+#else
+  (void)w; (void)ip;
+  return false;
+#endif
+}
+
 static const char* ci_find(const char* hay, const char* needle) {
   size_t n = strlen(needle);
   for (const char* p = hay; *p; ++p)
@@ -72,7 +81,7 @@ esp_err_t WebServer::begin(int port_, GpsDiscipline* gps_, NtpServer* ntp_, W550
 bool WebServer::tryStartListener() {
   uint32_t ipVal = 0;
   if (useWifi) {
-    if (!wifi || !wifi->getIpAddr(ipVal) || ipVal == 0) return false;
+    if (!wifi_ip(wifi, ipVal) || ipVal == 0) return false;
     listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_sock < 0) return false;
     int opt = 1;

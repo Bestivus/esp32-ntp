@@ -52,7 +52,13 @@ static const char* NVS_NS = "ntpcfg";
 #define PIN_OUT -1, 33
 #define PIN_IN  -1, 39
 
+#ifdef CONFIG_SOC_WIFI_SUPPORTED
 static const char* const kNetModes[] = { "wiznet", "wifi" };
+#define NET_MODE_MAX 1
+#else
+static const char* const kNetModes[] = { "wiznet" };
+#define NET_MODE_MAX 0
+#endif
 
 static const char* const kTzOpts[] = {
   "UTC0",                                    "UTC",
@@ -92,7 +98,7 @@ static const char* const kTzOpts[] = {
 
 const cfg_field_t g_cfg_fields[CFG_COUNT] = {
   [CFG_NET_MODE] = { .key="net.mode", .label="Interface", .group="Network", .type=CF_ENUM,
-                     .imin=0, .imax=1, .idef=DEF_NET_MODE, .names=kNetModes, .reboot=true },
+                     .imin=0, .imax=NET_MODE_MAX, .idef=DEF_NET_MODE, .names=kNetModes, .reboot=true },
   [CFG_NET_DHCP] = { .key="net.dhcp", .label="Use DHCP", .group="Network", .type=CF_BOOL,
                      .imin=0, .imax=1, .idef=DEF_NET_DHCP,
                      .help="Off means the three fields below are used.", .reboot=true },

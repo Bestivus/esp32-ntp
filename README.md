@@ -32,8 +32,9 @@ self-contained one that runs directly on an ESP32.
   self-calibrating estimate of the W5500 send latency, so it reflects actual wire egress. This
   removes the systematic offset that otherwise makes a polled SPI MAC look hundreds of microseconds
   off.
-- **Ethernet or Wi-Fi.** WIZnet W5500 (SPI) or Wi-Fi STA, selected at build time. Same NTP server
-  and metrics either way.
+- **Ethernet or Wi-Fi.** WIZnet W5500 (SPI) or Wi-Fi STA, switchable from the settings page. Same
+  NTP server and metrics either way. The Wi-Fi path compiles itself out on parts with no radio, so
+  the same source builds everywhere.
 - **Settings in flash, edited from a browser.** Network, timezone, display and every wiring pin are
   stored in NVS and changed from a page the device serves itself, no rebuild and no serial cable.
   Risky settings are gated, values are validated before they are written, and interrupting startup
@@ -103,9 +104,9 @@ algorithm against three independent clocks rather than by a one-off measurement 
   the PPS edge is latched by the capture submodule (capture is not separately gated: ESP-IDF builds
   `mcpwm_cap.c` on `SOC_MCPWM_SUPPORTED` alone, and the capture registers are present in every
   MCPWM-bearing target). **Two usable SPI hosts**, because SPI1 is tied to flash and the W5500 and
-  the display each need their own bus, so `SOC_SPI_PERIPH_NUM` has to be 3. **A WiFi radio**, because
-  `wifi_sta` is linked unconditionally today, which is a build artifact rather than a design
-  requirement. Checked against `soc_caps.h` in ESP-IDF v6.0.2:
+  the display each need their own bus, so `SOC_SPI_PERIPH_NUM` has to be 3. WiFi is **not** a
+  requirement: the WiFi path compiles itself out on parts without a radio, so those still build and
+  simply have no WiFi option. Checked against `soc_caps.h` in ESP-IDF v6.0.2:
 
   | Target | MCPWM | Usable SPI | WiFi | Verdict |
   |---|---|---|---|---|
@@ -117,14 +118,16 @@ algorithm against three independent clocks rather than by a one-off measurement 
   | ESP32-C2 | no | 1 | yes | Impossible, no MCPWM |
   | ESP32-C3 | no | 1 | yes | Impossible, no MCPWM |
   | ESP32-C61 | no | 1 | yes | Impossible, no MCPWM |
-  | ESP32-H4 | yes | 2 | no | Blocked only by the unconditional `wifi_sta` |
-  | ESP32-P4 | yes | 2 | no | Blocked only by the unconditional `wifi_sta` |
-  | ESP32-H2 | yes | 1 | no | Blocked by `wifi_sta`, and display-less even then |
-  | ESP32-H21 | yes | 1 | no | Blocked by `wifi_sta`, and display-less even then |
+  | ESP32-H4 | yes | 2 | no | Builds, Ethernet only, no WiFi option |
+  | ESP32-P4 | yes | 2 | no | Builds, Ethernet only, no WiFi option |
+  | ESP32-H2 | yes | 1 | no | Ethernet only, and no bus left for the display |
+  | ESP32-H21 | yes | 1 | no | Ethernet only, and no bus left for the display |
 
-  The four "impossible" rows have no MCPWM and no path forward. The H4 and P4 rows would come into
-  range if `wifi_sta` were made conditional on the selected interface. Anything other than the ESP32
-  also needs the pin map revisited, which assumes ESP32 GPIO numbering and its input-only 34 to 39.
+  The four "impossible" rows have no MCPWM and no path forward. Everything else builds from the same
+  source with no configuration change; dropping the WiFi path saves about 488 KB of flash where it
+  is not available. Anything other than the ESP32 also needs the pin map revisited, which assumes
+  ESP32 GPIO numbering and its input-only 34 to 39, and none of them have been built or measured
+  here.
 - **Toolchain:** ESP-IDF **v6.0**. Earlier versions predate the split driver components
   (`esp_driver_gpio`, `esp_driver_uart`, `esp_driver_spi`, `esp_driver_mcpwm`) that this project
   requires, so they fail at configure time rather than building something subtly wrong. CI builds

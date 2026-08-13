@@ -152,7 +152,9 @@ static void ntp_task(void* arg) {
     if (nowMs - lastHouse >= 20) {
       lastHouse = nowMs;
       if (g_ethernet) g_ethernet->loop();
+#if CONFIG_SOC_WIFI_SUPPORTED
       if (g_wifi) g_wifi->loop();
+#endif
       if (g_web) g_web->loop();
       unsigned long now = esp_timer_get_time() / 1000000ULL;
       if (now - lastLog >= 60) {
@@ -263,6 +265,7 @@ void app_main() {
       delete g_ethernet;
       g_ethernet = nullptr;
     }
+#if CONFIG_SOC_WIFI_SUPPORTED
   } else if (Config::getNetworkWifi()) {
     ESP_LOGI(TAG, "Initializing WiFi STA...");
     g_wifi = new WifiSta();
@@ -277,6 +280,7 @@ void app_main() {
       delete g_wifi;
       g_wifi = nullptr;
     }
+#endif
   }
   
   ESP_LOGI(TAG, "Applying timezone: %s", Config::getTimezone());
@@ -287,8 +291,10 @@ void app_main() {
 
   {
     uint32_t ip = 0;
-    bool up = (g_ethernet && g_ethernet->getIpAddr(ip)) ||
-              (g_wifi && g_wifi->getIpAddr(ip));
+    bool up = (g_ethernet && g_ethernet->getIpAddr(ip));
+#if CONFIG_SOC_WIFI_SUPPORTED
+    up = up || (g_wifi && g_wifi->getIpAddr(ip));
+#endif
     if (up) cfg_boot_healthy();
   }
 
