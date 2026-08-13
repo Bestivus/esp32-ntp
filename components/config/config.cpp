@@ -1,76 +1,38 @@
 // SPDX-License-Identifier: Unlicense
 
 #include "config.h"
+#include "config_store.h"
 #include "sdkconfig.h"
 #include <time.h>
 
-#ifndef CONFIG_APP_USE_PRESYNC_GLYPH
-#define CONFIG_APP_USE_PRESYNC_GLYPH 0
-#endif
-
 namespace Config {
 
-static const char* kNtpServer = CONFIG_APP_NTP_SERVER;
-static const int kNtpServerPort = CONFIG_APP_NTP_PORT; // for serving NTP
+void init(bool safeMode) { cfg_init(safeMode); }
+bool isSafeMode() { return cfg_safe_mode(); }
+bool isProvisioned() { return cfg_provisioned(); }
 
-// Display bus (defaults: VSPI / SPI3_HOST). CONFIG_APP_SPI_HOST holds the IDF
-// spi_host_device_t enum value directly (see Kconfig.projbuild).
-static const spi_host_device_t kSpiHost = (spi_host_device_t)CONFIG_APP_SPI_HOST;
-static const int kCsPin = CONFIG_APP_CS_PIN;           // MAX7219 display CS pin
-static const int kMaxDevices = CONFIG_APP_MAX_DEVICES;
-static const int kSpiClockHz = CONFIG_APP_SPI_CLOCK_HZ;
-static const int kSpiMosiPin = CONFIG_APP_SPI_MOSI_PIN;
-static const int kSpiMisoPin = -1;     // Display doesn't need MISO
-static const int kSpiSclkPin = CONFIG_APP_SPI_SCLK_PIN;
+int getNtpServerPort() { return cfg_int(CFG_NTP_PORT); }
+int getStatsPort() { return cfg_int(CFG_STATS_PORT); }
 
-static const char* kTimezone = CONFIG_APP_TZ;
+bool getUseDisplay() { return cfg_int(CFG_DISP_EN) != 0; }
+bool getUsePreSyncGlyph() { return cfg_int(CFG_DISP_GLYPH) != 0; }
+spi_host_device_t getSpiHost() { return (spi_host_device_t)cfg_int(CFG_DISP_HOST); }
+int getCsPin() { return cfg_int(CFG_DISP_CS); }
+int getMaxDevices() { return cfg_int(CFG_DISP_NDEV); }
+int getSpiClockHz() { return cfg_int(CFG_DISP_HZ); }
+int getSpiMosiPin() { return cfg_int(CFG_DISP_MOSI); }
+int getSpiMisoPin() { return -1; }     // Display doesn't need MISO
+int getSpiSclkPin() { return cfg_int(CFG_DISP_SCLK); }
 
-// GPS / PPS
-static const int kGpsUartPort = 2;   // UART2
-static const int kGpsUartBaud = 9600;
-static const int kGpsUartTxPin = 17; // not used by GPS NEO-6M
-static const int kGpsUartRxPin = 16; // GPS TX -> ESP RX
-static const int kPpsGpioPin = 19;   // PPS input (back to original pin!)
-// PPS offset calibration (microseconds, can be positive or negative)
-static const int64_t kPpsCalibrationUs = 0;  // MCPWM hardware capture — no ISR latency to compensate
+const char* getTimezone() { return cfg_str(CFG_SYS_TZ); }
+void applyTimezone() { setenv("TZ", cfg_str(CFG_SYS_TZ), 1); tzset(); }
 
-// W5500 Ethernet on HSPI (SPI2_HOST) - separate bus from display
-static const spi_host_device_t kW5500SpiHost = SPI2_HOST;  // HSPI for W5500
-static const int kW5500CsPin = 25;     // W5500 CS pin
-static const int kW5500MosiPin = 33;   // HSPI MOSI
-static const int kW5500MisoPin = 35;   // HSPI MISO (GPIO 35 is input-only, perfect for MISO)
-static const int kW5500SclkPin = 32;   // HSPI SCLK
-static const int kW5500IntPin = 34;    // W5500 INT pin (GPIO 34 is input-only, perfect for INT)
-static const int kW5500RstPin = 26;    // W5500 RST pin
-
-const char* getNtpServer() { return kNtpServer; }
-int getNtpServerPort() { return kNtpServerPort; }
-
-bool getUseDisplay() { 
-#ifdef CONFIG_APP_USE_DISPLAY
-	return CONFIG_APP_USE_DISPLAY;
-#else
-	return false;
-#endif
-}
-bool getUsePreSyncGlyph() { return CONFIG_APP_USE_PRESYNC_GLYPH; }
-spi_host_device_t getSpiHost() { return kSpiHost; }
-int getCsPin() { return kCsPin; }
-int getMaxDevices() { return kMaxDevices; }
-int getSpiClockHz() { return kSpiClockHz; }
-int getSpiMosiPin() { return kSpiMosiPin; }
-int getSpiMisoPin() { return kSpiMisoPin; }
-int getSpiSclkPin() { return kSpiSclkPin; }
-
-const char* getTimezone() { return kTimezone; }
-void applyTimezone() { setenv("TZ", kTimezone, 1); tzset(); }
-
-int getGpsUartPort() { return kGpsUartPort; }
-int getGpsUartBaud() { return kGpsUartBaud; }
-int getGpsUartTxPin() { return kGpsUartTxPin; }
-int getGpsUartRxPin() { return kGpsUartRxPin; }
-int getPpsGpioPin() { return kPpsGpioPin; }
-int64_t getPpsCalibrationUs() { return kPpsCalibrationUs; }
+int getGpsUartPort() { return cfg_int(CFG_GPS_UART); }
+int getGpsUartBaud() { return cfg_int(CFG_GPS_BAUD); }
+int getGpsUartTxPin() { return cfg_int(CFG_GPS_TX); }
+int getGpsUartRxPin() { return cfg_int(CFG_GPS_RX); }
+int getPpsGpioPin() { return cfg_int(CFG_PPS_GPIO); }
+int64_t getPpsCalibrationUs() { return (int64_t)cfg_int(CFG_PPS_CAL); }
 
 // Served-time calibration, microseconds, SUBTRACTED from both t2 and t3.
 //
@@ -87,88 +49,40 @@ int64_t getPpsCalibrationUs() { return kPpsCalibrationUs; }
 // With t3 now landing within ~5 us of egress the subtraction stopped being
 // cancelled and over-corrected: served offset sat at -6..-12 us median against
 // the GPS reference across three 60-sample runs. 7 us re-centres it.
-int getServeCalibrationUs() { return 7; }
+int getServeCalibrationUs() { return cfg_int(CFG_SERVE_CAL); }
 
-spi_host_device_t getW5500SpiHost() { return kW5500SpiHost; }
-int getW5500CsPin() { return kW5500CsPin; }
-int getW5500MosiPin() { return kW5500MosiPin; }
-int getW5500MisoPin() { return kW5500MisoPin; }
-int getW5500SclkPin() { return kW5500SclkPin; }
-int getW5500IntPin() { return kW5500IntPin; }
+spi_host_device_t getW5500SpiHost() { return (spi_host_device_t)cfg_int(CFG_W5_HOST); }
+int getW5500CsPin() { return cfg_int(CFG_W5_CS); }
+int getW5500MosiPin() { return cfg_int(CFG_W5_MOSI); }
+int getW5500MisoPin() { return cfg_int(CFG_W5_MISO); }
+int getW5500SclkPin() { return cfg_int(CFG_W5_SCLK); }
+int getW5500IntPin() { return cfg_int(CFG_W5_INT); }
 // SPI clock for the W5500. 20 MHz is the long-proven value on this wiring.
-// CEILING: reads are full duplex (the coalescing shim clocks the header out
-// while the payload comes in), and full-duplex transfers routed through the
-// GPIO matrix — which these are, since the SPI pins are arbitrary config
-// values rather than IO_MUX pins — top out at 26.6 MHz. Past that, READS
-// corrupt silently, which surfaces as wrong Sn_TX_FSR/Sn_TX_WR values and
-// therefore malformed packets rather than an obvious failure. Do not exceed
-// 26 MHz without moving SPI to the IO_MUX pins.
+// CEILING: reads are full duplex (the header is clocked out while the payload
+// comes in), and full-duplex transfers routed through the GPIO matrix — which
+// these are, since the SPI pins are arbitrary config values rather than IO_MUX
+// pins — top out at 26.6 MHz. Past that, READS corrupt silently, which surfaces
+// as wrong Sn_TX_FSR/Sn_TX_WR values and therefore malformed packets rather
+// than an obvious failure. Do not exceed 26 MHz without moving SPI to the
+// IO_MUX pins.
 // TRIED AND REVERTED: 80 MHz / 3 = 26.67 MHz. The divider is integral, so that
 // is the only step above 20 MHz that exists (anything between rounds back down
 // to 80/4). At 26.67 MHz this board does not come up at all — no NTP, no
 // /metrics, no ICMP — so the ceiling above is optimistic for this wiring rather
 // than merely marginal. It stays at 20 MHz. Byte clocking is only ~100 us of the
 // reply path anyway, so the most this could ever have returned is ~25 us.
-int getW5500SpiHz() { return 20000000; }
-int getW5500RstPin() { return kW5500RstPin; }
+int getW5500SpiHz() { return cfg_int(CFG_W5_HZ); }
+int getW5500RstPin() { return cfg_int(CFG_W5_RST); }
 
-bool getNetworkWiznet() {
-#ifdef CONFIG_APP_NETWORK_WIZNET
-  return true;
-#else
-  return false;
-#endif
-}
-bool getNetworkWifi() {
-#ifdef CONFIG_APP_NETWORK_WIFI
-  return true;
-#else
-  return false;
-#endif
-}
+bool getNetworkWiznet() { return cfg_int(CFG_NET_MODE) == 0; }
+bool getNetworkWifi() { return cfg_int(CFG_NET_MODE) == 1; }
 
-const char* getWifiSsid() {
-#ifdef CONFIG_APP_NETWORK_WIFI
-  return CONFIG_APP_WIFI_SSID;
-#else
-  return "";
-#endif
-}
-const char* getWifiPassword() {
-#ifdef CONFIG_APP_NETWORK_WIFI
-  return CONFIG_APP_WIFI_PASSWORD;
-#else
-  return "";
-#endif
-}
+const char* getWifiSsid() { return cfg_str(CFG_WIFI_SSID); }
+const char* getWifiPassword() { return cfg_str(CFG_WIFI_PASS); }
 
-bool getUseStaticIp() {
-#ifdef CONFIG_APP_USE_STATIC_IP
-  return true;
-#else
-  return false;
-#endif
-}
-const char* getStaticIp() {
-#ifdef CONFIG_APP_USE_STATIC_IP
-  return CONFIG_APP_STATIC_IP_ADDR;
-#else
-  return "192.168.1.100";
-#endif
-}
-const char* getStaticGw() {
-#ifdef CONFIG_APP_USE_STATIC_IP
-  return CONFIG_APP_STATIC_GW;
-#else
-  return "192.168.1.1";
-#endif
-}
-const char* getStaticNetmask() {
-#ifdef CONFIG_APP_USE_STATIC_IP
-  return CONFIG_APP_STATIC_NETMASK;
-#else
-  return "255.255.255.0";
-#endif
-}
+bool getUseStaticIp() { return cfg_int(CFG_NET_DHCP) == 0; }
+const char* getStaticIp() { return cfg_str(CFG_NET_IP); }
+const char* getStaticGw() { return cfg_str(CFG_NET_GW); }
+const char* getStaticNetmask() { return cfg_str(CFG_NET_MASK); }
 
 }

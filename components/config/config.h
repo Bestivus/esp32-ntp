@@ -4,8 +4,14 @@
 #include "driver/spi_master.h"
 
 namespace Config {
-const char* getNtpServer();
+// Load settings from NVS. safeMode serves build-time defaults and skips NVS
+// entirely, so a committed setting can never make the device unrecoverable.
+void init(bool safeMode);
+bool isSafeMode();
+bool isProvisioned();
+
 int getNtpServerPort();
+int getStatsPort();
 
 bool getUseDisplay();
 bool getUsePreSyncGlyph();

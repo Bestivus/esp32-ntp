@@ -1,0 +1,113 @@
+#pragma once
+// SPDX-License-Identifier: Unlicense
+/*
+ * Runtime settings, persisted in NVS, with the Kconfig build-time value as the
+ * fallback for every key. An unprovisioned device therefore behaves exactly as
+ * a pre-NVS build did, and safe mode ignores NVS entirely so a bad pin commit
+ * is always recoverable without a reflash.
+ *
+ * One table drives everything: config.cpp reads it, the management UI renders
+ * and parses it. Adding a setting means adding one row.
+ */
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define CFG_STR_MAX 64
+
+typedef enum {
+  CFG_NET_MODE = 0,
+  CFG_NET_DHCP,
+  CFG_NET_IP,
+  CFG_NET_GW,
+  CFG_NET_MASK,
+  CFG_WIFI_SSID,
+  CFG_WIFI_PASS,
+  CFG_SYS_TZ,
+  CFG_NTP_PORT,
+  CFG_STATS_PORT,
+  CFG_UI_PASS,
+  CFG_DISP_EN,
+  CFG_DISP_GLYPH,
+  CFG_DISP_HOST,
+  CFG_DISP_CS,
+  CFG_DISP_MOSI,
+  CFG_DISP_SCLK,
+  CFG_DISP_HZ,
+  CFG_DISP_NDEV,
+  CFG_W5_HOST,
+  CFG_W5_CS,
+  CFG_W5_MOSI,
+  CFG_W5_MISO,
+  CFG_W5_SCLK,
+  CFG_W5_INT,
+  CFG_W5_RST,
+  CFG_W5_HZ,
+  CFG_GPS_UART,
+  CFG_GPS_RX,
+  CFG_GPS_TX,
+  CFG_GPS_BAUD,
+  CFG_PPS_GPIO,
+  CFG_PPS_CAL,
+  CFG_SERVE_CAL,
+  CFG_COUNT
+} cfg_id_t;
+
+typedef enum { CF_BOOL, CF_INT, CF_STR, CF_PASS, CF_ENUM } cfg_type_t;
+
+typedef struct {
+  const char* key;               /* NVS key, <= 15 chars                     */
+  const char* label;             /* shown in the management UI               */
+  const char* group;             /* UI section heading                       */
+  cfg_type_t type;
+  int32_t imin, imax;            /* inclusive range for CF_INT/CF_ENUM       */
+  int32_t idef;                  /* build-time default for numeric types     */
+  const char* sdef;              /* build-time default for string types      */
+  const char* const* names;      /* CF_ENUM labels, imax+1 entries           */
+  const char* const* opts;       /* CF_STR dropdown: value,label pairs, NULL-terminated */
+  const char* help;              /* one line under the field in the UI       */
+  bool reboot;                   /* change only takes effect after restart   */
+  bool advanced;                 /* wiring and timing: hidden behind a disclosure */
+} cfg_field_t;
+
+extern const cfg_field_t g_cfg_fields[CFG_COUNT];
+
+/* safe_mode: serve every field from its build-time default and never read NVS.
+ * Writes are still allowed, so the UI can repair a bad config in place. */
+void cfg_init(bool safe_mode);
+bool cfg_safe_mode(void);
+bool cfg_provisioned(void);
+
+int32_t     cfg_int(cfg_id_t id);
+const char* cfg_str(cfg_id_t id);
+
+/* Look a field up by NVS key; CFG_COUNT when unknown. */
+cfg_id_t cfg_lookup(const char* key);
+
+/* Validate and stage a value from form input. Returns false and leaves the
+ * cached value untouched when the input is out of range or malformed. */
+bool cfg_stage(cfg_id_t id, const char* value);
+bool cfg_dirty(void);
+
+esp_err_t cfg_commit(void);          /* persist every staged value to NVS */
+esp_err_t cfg_factory_reset(void);   /* erase the namespace entirely      */
+
+/*
+ * Boot health, used by the automatic fallback. cfg_boot_begin() counts an
+ * attempt and returns how many prior attempts never came up; cfg_boot_healthy()
+ * clears it once the device is actually on the network. The counter lives in
+ * RTC RAM, never flash, because it moves on every boot.
+ */
+#define CFG_SAFE_MODE_FAILS 3
+
+uint8_t cfg_boot_begin(void);
+void    cfg_boot_healthy(void);
+
+#ifdef __cplusplus
+}
+#endif

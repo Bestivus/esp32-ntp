@@ -18,6 +18,7 @@
 #include "esp_pm.h"
 
 #include "config.h"
+#include "config_store.h"
 #include "display.h"
 #include "gps.h"
 #include "esp_task_wdt.h"
@@ -199,6 +200,25 @@ void app_main() {
     ESP_LOGI(TAG, "Boot count: %u, reset reason: %d", (unsigned)g_bootCount, (int)esp_reset_reason());
   }
 
+  // Settings come from NVS, falling back to the build-time defaults for any key
+  // that was never written. Three boots that never reached the network — a bad
+  // pin, or a human pressing RESET repeatedly — serve the defaults instead, so
+  // no committed value can put the device beyond reach of its own config page.
+  {
+    uint8_t priorFails = cfg_boot_begin();
+    bool safeMode = priorFails >= CFG_SAFE_MODE_FAILS;
+    Config::init(safeMode);
+    if (safeMode) {
+      ESP_LOGE(TAG, "SAFE MODE after %u incomplete boots: build-time defaults, "
+                    "stored settings ignored until you save from the config page",
+               (unsigned)priorFails);
+    } else if (Config::isProvisioned()) {
+      ESP_LOGI(TAG, "Using stored settings from NVS");
+    } else {
+      ESP_LOGI(TAG, "No stored settings, using build-time defaults");
+    }
+  }
+
   // Set a reasonable initial time to avoid massive NTP corrections
   struct timeval tv;
   gettimeofday(&tv, nullptr);
@@ -267,6 +287,13 @@ void app_main() {
   ESP_LOGI(TAG, "Waiting for network connection...");
   vTaskDelay(pdMS_TO_TICKS(5000));
 
+  {
+    uint32_t ip = 0;
+    bool up = (g_ethernet && g_ethernet->getIpAddr(ip)) ||
+              (g_wifi && g_wifi->getIpAddr(ip));
+    if (up) cfg_boot_healthy();
+  }
+
   if (Config::getUseDisplay()) {
     ESP_LOGI(TAG, "Initializing display...");
     g_display = new Display(Config::getSpiHost(), Config::getCsPin(), Config::getMaxDevices(), Config::getSpiClockHz());
@@ -317,7 +344,7 @@ void app_main() {
   }
 
   g_ntpStats = new NtpStats();
-  g_ntpStats->begin(8080, g_gps, g_ntpServer, g_ethernet, g_wifi);
+  g_ntpStats->begin(Config::getStatsPort(), g_gps, g_ntpServer, g_ethernet, g_wifi);
   gettimeofday(&tv, nullptr);
   struct tm timeinfo;
   localtime_r(&tv.tv_sec, &timeinfo);
