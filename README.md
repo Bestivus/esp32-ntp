@@ -96,11 +96,15 @@ algorithm against three independent clocks rather than by a one-off measurement 
   <img src="docs/esp32-ntp-wiring.svg" alt="ESP32 stratum-1 NTP signal wiring: u-blox NEO-6M GPS (NMEA over UART, PPS into GPIO19 captured by MCPWM), and the WIZnet W5500 over SPI with INTn on GPIO34 for hardware RX timestamping. The two hardware-timestamped nets, PPS and INTn, are in coral." width="720">
 </p>
 
-- **MCU:** ESP32, and specifically the original ESP32 (IDF target `esp32`). **Not** the S2, C3, C6
-  or H2. The whole approach rests on the **MCPWM capture** peripheral latching the PPS edge in
-  silicon, and those parts have no MCPWM at all, so there is nothing to port to. The S3 does have
-  MCPWM and is plausible, but nothing here has been built or measured on one. 2 MB of flash is
-  enough; the app partition is 1.9 MB and about half free.
+- **MCU:** the original ESP32 (IDF target `esp32`). It is the only part this has been built and
+  measured on. The approach rests on the **MCPWM capture** peripheral latching the PPS edge in
+  silicon, which splits the family in two (per `soc_caps.h` in ESP-IDF v6.0.2):
+  - **No MCPWM at all, so nothing to port to:** ESP32-S2, ESP32-C2, ESP32-C3, ESP32-C61.
+  - **Has MCPWM, so conceivably portable, but untried here:** ESP32-S3, ESP32-C5, ESP32-C6,
+    ESP32-H2, ESP32-H21, ESP32-H4, ESP32-P4. Expect work beyond the capture path: the pin map
+    assumes ESP32 GPIO numbering and its input-only 34 to 39, and the SPI host numbering differs.
+
+  2 MB of flash is enough; the app partition is 1.9 MB and about half free.
 - **Toolchain:** ESP-IDF **v6.0**. Earlier versions predate the split driver components
   (`esp_driver_gpio`, `esp_driver_uart`, `esp_driver_spi`, `esp_driver_mcpwm`) that this project
   requires, so they fail at configure time rather than building something subtly wrong. CI builds
@@ -125,7 +129,7 @@ Street prices for the clone-grade parts most people actually buy (AliExpress / H
 | --- | --- | --- |
 | ESP32 DevKitC / WROOM-32 dev board | MCU, MCPWM capture, servo | $5 |
 
-The MCU row means the original ESP32 specifically; see **Hardware** above for why the S2/C3/C6/H2 cannot run this.
+The MCU row means the original ESP32 specifically. See **Hardware** above for which parts in the family can and cannot run this, and why.
 | NEO-6M GPS module + ceramic antenna | GPS fix and the PPS edge | $6 |
 | WIZnet W5500 module (RJ45 + magnetics) | wired Ethernet, hardware timestamping | $7 |
 | Jumper wires / small perfboard | wiring | $2 |
