@@ -119,7 +119,7 @@ algorithm against three independent clocks rather than by a one-off measurement 
   | ESP32-C3 | no | 1 | yes | Impossible, no MCPWM |
   | ESP32-C61 | no | 1 | yes | Impossible, no MCPWM |
   | ESP32-H4 | yes | 2 | no | Builds, Ethernet only, no WiFi option |
-  | ESP32-P4 | yes | 2 | no | Builds, Ethernet only, no WiFi option |
+  | ESP32-P4 | yes | 2 | no | Builds, but do not: see below |
   | ESP32-H2 | yes | 1 | no | Ethernet only, and no bus left for the display |
   | ESP32-H21 | yes | 1 | no | Ethernet only, and no bus left for the display |
 
@@ -128,6 +128,15 @@ algorithm against three independent clocks rather than by a one-off measurement 
   is not available. Anything other than the ESP32 also needs the pin map revisited, which assumes
   ESP32 GPIO numbering and its input-only 34 to 39, and none of them have been built or measured
   here.
+
+  **The ESP32-P4 is a special case: it builds, and you should not.** It is the one part in the
+  family whose Ethernet MAC does IEEE 1588v2 hardware timestamping
+  (`SOC_EMAC_IEEE1588V2_SUPPORTED`), so the packet timestamps this project works so hard to
+  approximate with a W5500 and an interrupt edge are simply available in silicon. Bolting an SPI NIC
+  onto a P4 would be strictly worse than using its own MAC, and it is a far more expensive part.
+  That gap is also the reason the W5500 exists here at all: the original ESP32 has an EMAC, but
+  without 1588 support, so an external MAC whose `INTn` marks arrival is the closest thing to a
+  hardware receive timestamp this silicon can offer.
 - **Toolchain:** ESP-IDF **v6.0**. Earlier versions predate the split driver components
   (`esp_driver_gpio`, `esp_driver_uart`, `esp_driver_spi`, `esp_driver_mcpwm`) that this project
   requires, so they fail at configure time rather than building something subtly wrong. CI builds
