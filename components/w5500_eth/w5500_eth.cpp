@@ -87,7 +87,7 @@ static void w5k_flush_write(void) {
   spi_transaction_t t = {};
   t.length = (size_t)s_frame_len * 8;
   t.tx_buffer = s_frame_tx;
-  g_w5k_txns++; g_w5k_bytes += s_frame_len;
+  g_w5k_txns = g_w5k_txns + 1; g_w5k_bytes = g_w5k_bytes + s_frame_len;
   spi_device_polling_transmit(g_spi_handle, &t);
   s_frame_len = 0;
 }
@@ -111,7 +111,7 @@ static void w5k_flush_read(uint8_t* out, uint16_t len) {
   t.rxlength = (size_t)total * 8;
   t.tx_buffer = s_frame_tx;
   t.rx_buffer = s_frame_rx;
-  g_w5k_txns++; g_w5k_bytes += total;
+  g_w5k_txns = g_w5k_txns + 1; g_w5k_bytes = g_w5k_bytes + total;
   spi_device_polling_transmit(g_spi_handle, &t);
   memcpy(out, &s_frame_rx[s_frame_len], len);
   s_frame_len = 0;
@@ -210,7 +210,7 @@ static inline void IRAM_ATTR w5k_cs_high(void) {
  * s_fast_rx. Full duplex, which is what the shim already relies on. */
 static void IRAM_ATTR w5k_fifo_xfer(uint16_t total, bool want_rx) {
   const size_t bits = (size_t)total * 8;
-  g_w5k_txns++; g_w5k_bytes += total; g_w5k_sels++;
+  g_w5k_txns = g_w5k_txns + 1; g_w5k_bytes = g_w5k_bytes + total; g_w5k_sels = g_w5k_sels + 1;
 
 #if !W5K_DIRECT_SPI
   spi_transaction_t t = {};
@@ -273,7 +273,7 @@ extern "C" void IRAM_ATTR w5k_xfer_rd(uint32_t addrsel, uint8_t* buf, uint16_t l
 }
 
 static void wizchip_select(void) {
-  g_w5k_sels++;
+  g_w5k_sels = g_w5k_sels + 1;
   if (g_cs_pin >= 0) {
     gpio_set_level((gpio_num_t)g_cs_pin, 0);
   }
@@ -314,7 +314,7 @@ static void wizchip_writeburst(uint8_t* pBuf, uint16_t len) {
       spi_transaction_t t = {};
       t.length = (size_t)len * 8;
       t.tx_buffer = pBuf;
-      g_w5k_txns++; g_w5k_bytes += len;
+      g_w5k_txns = g_w5k_txns + 1; g_w5k_bytes = g_w5k_bytes + len;
       if (g_spi_handle) spi_device_polling_transmit(g_spi_handle, &t);
       return;
     }
