@@ -3,6 +3,7 @@
 
 #include <string.h>
 #include <sys/time.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -102,7 +103,7 @@ static void discipline_task(void* arg) {
   esp_task_wdt_add(nullptr);
   gps_register_task(xTaskGetCurrentTaskHandle());
   for (;;) {
-    g_mainLoopBeats++;              /* liveness, exported over /metrics */
+    g_mainLoopBeats = g_mainLoopBeats + 1;              /* liveness, exported over /metrics */
     /*
      * Wake on the PPS capture edge instead of polling for it. The 50 ms timeout
      * is a safety net, not the mechanism: it keeps the holdover checks in
