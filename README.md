@@ -96,9 +96,18 @@ algorithm against three independent clocks rather than by a one-off measurement 
   <img src="docs/esp32-ntp-wiring.svg" alt="ESP32 stratum-1 NTP signal wiring: u-blox NEO-6M GPS (NMEA over UART, PPS into GPIO19 captured by MCPWM), and the WIZnet W5500 over SPI with INTn on GPIO34 for hardware RX timestamping. The two hardware-timestamped nets, PPS and INTn, are in coral." width="720">
 </p>
 
-- **MCU:** ESP32 (IDF target `esp32`). The build pins the crystal at 40 MHz (`CONFIG_XTAL_FREQ`);
-  some modules ship with a 26 MHz crystal instead, and the tell is garbage on the serial console at
-  115200. If that's your board, change `CONFIG_XTAL_FREQ` in `menuconfig`.
+- **MCU:** ESP32, and specifically the original ESP32 (IDF target `esp32`). **Not** the S2, C3, C6
+  or H2. The whole approach rests on the **MCPWM capture** peripheral latching the PPS edge in
+  silicon, and those parts have no MCPWM at all, so there is nothing to port to. The S3 does have
+  MCPWM and is plausible, but nothing here has been built or measured on one. 2 MB of flash is
+  enough; the app partition is 1.9 MB and about half free.
+- **Toolchain:** ESP-IDF **v6.0**. Earlier versions predate the split driver components
+  (`esp_driver_gpio`, `esp_driver_uart`, `esp_driver_spi`, `esp_driver_mcpwm`) that this project
+  requires, so they fail at configure time rather than building something subtly wrong. CI builds
+  v6.0.2 from a clean clone.
+- **Crystal:** the build pins 40 MHz (`CONFIG_XTAL_FREQ`); some modules ship with a 26 MHz crystal
+  instead, and the tell is garbage on the serial console at 115200. If that's your board, change
+  `CONFIG_XTAL_FREQ` in `menuconfig`.
 - **GPS:** any UART NMEA module with a PPS output (for example NEO-6M, NEO-M8N, or NEO-M9N). PPS
   goes to any GPIO, including input-only pins 34 to 39, because it's captured by the MCPWM
   peripheral.
@@ -115,6 +124,8 @@ Street prices for the clone-grade parts most people actually buy (AliExpress / H
 | Part | Role | Typical price |
 | --- | --- | --- |
 | ESP32 DevKitC / WROOM-32 dev board | MCU, MCPWM capture, servo | $5 |
+
+The MCU row means the original ESP32 specifically; see **Hardware** above for why the S2/C3/C6/H2 cannot run this.
 | NEO-6M GPS module + ceramic antenna | GPS fix and the PPS edge | $6 |
 | WIZnet W5500 module (RJ45 + magnetics) | wired Ethernet, hardware timestamping | $7 |
 | Jumper wires / small perfboard | wiring | $2 |
@@ -139,7 +150,8 @@ would sit in the milliseconds.
 ## Build and flash
 
 Prerequisites:
-- ESP-IDF installed (tested with a v6.0-dev toolchain), with `IDF_PATH` set.
+- ESP-IDF v6.0 installed, with `IDF_PATH` set. CI builds v6.0.2; earlier versions do not have the
+  split driver components this project requires.
 
 ```bash
 make build          # idf.py build
@@ -170,8 +182,8 @@ http://<device-ip>:8080/
 
 Everyday settings are on the page directly: network interface, DHCP or a static address, timezone
 (a dropdown of common zones, not a raw POSIX string), the display toggles, the management port, and
-an optional password. Wiring settings — every GPIO, SPI host, SPI clock, the GPS UART and the PPS
-pin — sit behind an **Advanced** disclosure, because a wrong pin there takes the clock off the
+an optional password. Wiring settings (every GPIO, SPI host, SPI clock, the GPS UART and the PPS
+pin) sit behind an **Advanced** disclosure, because a wrong pin there takes the clock off the
 network on the next restart.
 
 Saving writes only the fields you changed and reboots. Values are validated before anything reaches
