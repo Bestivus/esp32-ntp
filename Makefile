@@ -2,8 +2,8 @@ SHELL := /usr/bin/bash
 
 # SPDX-License-Identifier: Unlicense
 
-# Adjust if your ESP-IDF lives elsewhere
-IDF_PATH ?= /home/jr/esp/esp-idf
+# Adjust if your ESP-IDF lives elsewhere (or export IDF_PATH)
+IDF_PATH ?= $(HOME)/esp/esp-idf
 IDF_EXPORT := . $(IDF_PATH)/export.sh &&
 
 # Common vars
