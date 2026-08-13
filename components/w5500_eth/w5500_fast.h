@@ -1,24 +1,23 @@
 #pragma once
 // SPDX-License-Identifier: Unlicense
 /*
- * One W5500 access == one SPI transaction.
+ * One W5500 access == one SPI transaction, with zero driver overhead.
  *
  * A W5500 frame is [addr_hi][addr_lo][control][data...] and, in variable-length
  * data mode, the data phase is delimited by CS rather than by transaction
- * boundaries. The ioLibrary reaches the same wire format but does so through
- * per-byte callbacks: the coalescing shim in w5500_eth.cpp has to flush the
- * three header bytes as their own transaction before it can read, so every
- * register read costs two transactions and every access costs a CS pair plus
- * driver bookkeeping. Measured at 160 MHz with the bus pre-acquired, a
+ * boundaries. Measured at 160 MHz with the bus pre-acquired, a driver-managed
  * transaction costs ~15 us of fixed overhead against ~0.4 us/byte of actual
  * clocking at 20 MHz, so the transaction COUNT — not SPI bandwidth — is what
- * the reply latency is made of.
+ * the reply latency is made of. On this FIFO path at 240 MHz the fixed
+ * overhead is ~3-4 us per transaction (rx_ready span 6.2 us for one 5-byte
+ * access, of which 2 us is clocking; 2026-08-13 bench).
  *
- * These two functions assemble the header and payload into one buffer and issue
- * exactly one spi_device_polling_transmit() with CS held around it. They are
- * for the NTP reply path only; everything else keeps using the ioLibrary.
+ * These two functions assemble the header and payload into one buffer and
+ * clock it through the SPI peripheral's FIFO directly (see w5k_fifo_xfer in
+ * w5500_eth.cpp). They are for the NTP reply path only; everything else goes
+ * through the driver-managed w5500_bus_rd/w5500_bus_wr in w5500_drv.h.
  *
- * `addrsel` follows the ioLibrary's encoding: (offset << 8) | (block << 3).
+ * `addrsel` packs the access as (offset << 8) | (block << 3).
  */
 #include <stdint.h>
 

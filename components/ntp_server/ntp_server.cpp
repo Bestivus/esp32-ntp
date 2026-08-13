@@ -658,7 +658,7 @@ void IRAM_ATTR NtpServer::loop() {
    * answering. Until the cause is instrumented properly, correctness wins.
    */
   /* t3 is left zero in the staged copy on purpose: the late path patches those
-   * eight bytes in the chip's TX buffer just before SEND, and the library
+   * eight bytes in the chip's TX buffer just before SEND, and the blocking
    * fallback recomputes them into rsp itself. Filling them here only bought a
    * redundant timestamp conversion on the critical path. */
   uint32_t t3_sec = 0, t3_frac = 0;
@@ -667,16 +667,15 @@ void IRAM_ATTR NtpServer::loop() {
    * Late-stamped send with verification and fallback.
    *
    * Goal: get t3 as close to the wire as possible. Preferred path stages the
-   * whole 48-byte datagram in ONE wiz_send_data() (so there is no Sn_TX_WR
-   * advance to lose between calls), then patches the 8 t3 bytes in place at
-   * their offset in the socket TX buffer and issues SEND — only those 8 bytes
-   * and the command separate the timestamp from transmission.
+   * whole 48-byte datagram with ONE ring write and ONE Sn_TX_WR advance (so
+   * there is no advance to lose between calls), then patches the 8 t3 bytes
+   * in place at their offset in the socket TX buffer and issues SEND — only
+   * those 8 bytes and the command separate the timestamp from transmission.
    *
-   * Every step is verified. If staging does not advance Sn_TX_WR by exactly
-   * the frame length, the frame is NOT transmitted from that state; the code
-   * falls back to the plain library send, which is known good. An earlier
-   * unverified split emitted 8-byte frames to every peer, so correctness here
-   * is enforced rather than assumed.
+   * Every step is verified. If staging fails, the frame is NOT transmitted
+   * from that state; the code falls back to the plain blocking send, which is
+   * known good. An earlier unverified split emitted 8-byte frames to every
+   * peer, so correctness here is enforced rather than assumed.
    */
   uint8_t tail[8];
   uint16_t stampBase = 0;
@@ -757,7 +756,7 @@ void IRAM_ATTR NtpServer::loop() {
   }
 
   if (!late) {
-    /* Fallback: stamp t3 then hand the whole frame to the library. */
+    /* Fallback: stamp t3 then hand the whole frame to the blocking send. */
     s_lateStampFallbacks++;
     computeNtpTimestamp(esp_timer_get_time() + (uint64_t)(s_txCorrectionUs + 0.5),
                         locked, t3_sec, t3_frac);

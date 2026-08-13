@@ -225,12 +225,9 @@ cable.
 - `components/ntp_stats`: HTTP `/metrics` server over W5500 TCP or Wi-Fi TCP.
 - `components/w5500_eth`: W5500 SPI driver, DHCP/static IP, PHY setup, and the link/health watchdog.
 - `components/wifi_sta`: Wi-Fi STA with DHCP or static IP.
-- `components/w5k`: thin UDP/TCP wrapper over the WIZnet ioLibrary sockets.
+- `components/w5k`: latency-tuned UDP/TCP wrappers over the W5500 driver for the NTP reply path.
 - `components/display`: MAX7219 display driver and rendering.
-- `ioLibrary_Driver`: WIZnet W5x00 reference driver (git submodule, licensed separately by WIZnet).
 
 ## License
 
-All original code in this repository is released into the public domain under **The Unlicense**, see `LICENSE`.
-The `ioLibrary_Driver` submodule and other bundled third-party components retain their own upstream
-licenses.
+All code in this repository is released into the public domain under **The Unlicense**, see `LICENSE`.

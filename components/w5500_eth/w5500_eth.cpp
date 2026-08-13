@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Unlicense
 
 #include "w5500_eth.h"
+#include "w5500_drv.h"
+#include "w5500_dhcp.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_event.h"
@@ -27,12 +29,6 @@ static bool parse_ip4(const char* str, uint8_t* out) {
   return true;
 }
 
-extern "C" {
-#include "wizchip_conf.h"
-#include "W5500/w5500.h"
-#include "dhcp.h"
-}
-
 static const char* TAG = "W5500";
 
 static spi_device_handle_t g_spi_handle = nullptr;
@@ -40,35 +36,14 @@ static int g_cs_pin = -1;
 static int g_rst_pin = -1;
 
 static const uint8_t DHCP_SOCKET_NUM = 0;
-static uint8_t s_dhcp_buf[548];
 
-/*
- * Coalescing SPI shim.
- *
- * A W5500 SPI frame is [addr_hi][addr_lo][control][data...] with
- * auto-incrementing addresses in VDM (OM=00), so ONE transaction of 3+N bytes
- * performs an entire access. The ioLibrary, however, emits the three header
- * bytes through single-byte callbacks, so a plain register read cost four
- * separate spi_device_polling_transmit() calls — and each call's fixed
- * overhead dwarfs the ~0.4 us of actual clocking at 20 MHz. That per-call
- * tax, not SPI bandwidth, is what made a 48-byte UDP send take ~700 us.
- *
- * CS is a manual GPIO here (spics_io_num = -1) and is held low across the
- * whole frame, so bytes can be accumulated between select and deselect and
- * issued as one transaction. Within a frame the W5500 protocol is either read
- * or write (the RWB bit says which), never both, so buffering cannot reorder
- * anything. Reads are full-duplex: the accumulated header is clocked out while
- * the payload is clocked in.
- *
- * Falls back to per-call transactions if a frame ever exceeds the buffer.
- */
-/* 3-byte header + 2048-byte socket buffer = 2051 max; rounded up and word
+/* Frame staging for the pre-arming driver path (w5500_bus_rd/wr below).
+ * 3-byte header + 2048-byte socket buffer = 2051 max; rounded up and word
  * aligned because with DMA enabled the driver may write up to 3 bytes past an
  * unaligned RX length. */
 #define W5K_FRAME_MAX 2064
 static WORD_ALIGNED_ATTR uint8_t s_frame_tx[W5K_FRAME_MAX + 4];
 static WORD_ALIGNED_ATTR uint8_t s_frame_rx[W5K_FRAME_MAX + 4];
-static uint16_t s_frame_len = 0;    /* bytes accumulated, not yet on the wire */
 
 /*
  * Attribution counters. Every microsecond in the reply path is either SPI
@@ -79,42 +54,7 @@ static uint16_t s_frame_len = 0;    /* bytes accumulated, not yet on the wire */
 extern "C" {
 volatile uint32_t g_w5k_txns  = 0;   /* spi_device_polling_transmit() calls */
 volatile uint32_t g_w5k_bytes = 0;   /* bytes clocked, header included */
-volatile uint32_t g_w5k_sels  = 0;   /* wizchip_select() calls (bus acquires) */
-}
-
-static void w5k_flush_write(void) {
-  if (s_frame_len == 0 || !g_spi_handle) { s_frame_len = 0; return; }
-  spi_transaction_t t = {};
-  t.length = (size_t)s_frame_len * 8;
-  t.tx_buffer = s_frame_tx;
-  g_w5k_txns = g_w5k_txns + 1; g_w5k_bytes = g_w5k_bytes + s_frame_len;
-  spi_device_polling_transmit(g_spi_handle, &t);
-  s_frame_len = 0;
-}
-
-/* Clock out whatever header has accumulated and read len bytes in the same
- * transaction. */
-static void w5k_flush_read(uint8_t* out, uint16_t len) {
-  if (!g_spi_handle || len == 0) return;
-  uint16_t total = s_frame_len + len;
-  if (total > W5K_FRAME_MAX) {
-    /* Unreachable: the largest real frame is 3 + Sn_TxMAX(2048) = 2051. Fail
-     * loudly rather than hand a caller's unaligned buffer to DMA. */
-    ESP_LOGE(TAG, "W5500 frame %u exceeds buffer — read dropped", total);
-    s_frame_len = 0;
-    memset(out, 0, len);
-    return;
-  }
-  memset(&s_frame_tx[s_frame_len], 0xFF, len);
-  spi_transaction_t t = {};
-  t.length = (size_t)total * 8;
-  t.rxlength = (size_t)total * 8;
-  t.tx_buffer = s_frame_tx;
-  t.rx_buffer = s_frame_rx;
-  g_w5k_txns = g_w5k_txns + 1; g_w5k_bytes = g_w5k_bytes + total;
-  spi_device_polling_transmit(g_spi_handle, &t);
-  memcpy(out, &s_frame_rx[s_frame_len], len);
-  s_frame_len = 0;
+volatile uint32_t g_w5k_sels  = 0;   /* CS assertions (bus acquires) */
 }
 
 /*
@@ -142,8 +82,8 @@ static void w5k_bus_hold(void) {
 
 /*
  * Bespoke single-transaction accessors for the NTP reply path (see
- * w5500_fast.h). Separate buffers from the shim's, so a fast access can never
- * be issued in the middle of a library frame that is still accumulating.
+ * w5500_fast.h). Separate buffers from the management path's, so a fast access
+ * can never collide with a management frame.
  */
 static WORD_ALIGNED_ATTR uint8_t s_fast_tx[3 + 64 + 4];
 static WORD_ALIGNED_ATTR uint8_t s_fast_rx[3 + 64 + 4];
@@ -167,9 +107,9 @@ static WORD_ALIGNED_ATTR uint8_t s_fast_rx[3 + 64 + 4];
  * bit length and the bytes.
  *
  * So: let the driver configure the peripheral once (it already does, during
- * wizchip_init), then for the hot path write the length, load the peripheral's
+ * chip init), then for the hot path write the length, load the peripheral's
  * data buffer, and start. Everything else is left exactly as the driver set it,
- * which is why the library path can keep using the driver on the same device.
+ * which is why the management path can keep using the driver on the same device.
  *
  * Safe here because the NTP task owns this bus by design (see ntp_task in
  * app_main.cpp) and because spi_device_acquire_bus(), which is held for the
@@ -207,7 +147,7 @@ static inline void IRAM_ATTR w5k_cs_high(void) {
 }
 
 /* Clock `total` bytes out of s_fast_tx; if `want_rx`, capture them into
- * s_fast_rx. Full duplex, which is what the shim already relies on. */
+ * s_fast_rx. Full duplex, which is what the W5500 protocol relies on. */
 static void IRAM_ATTR w5k_fifo_xfer(uint16_t total, bool want_rx) {
   const size_t bits = (size_t)total * 8;
   g_w5k_txns = g_w5k_txns + 1; g_w5k_bytes = g_w5k_bytes + total; g_w5k_sels = g_w5k_sels + 1;
@@ -282,65 +222,96 @@ extern "C" void IRAM_ATTR w5k_xfer_rd(uint32_t addrsel, uint8_t* buf, uint16_t l
   memcpy(buf, &s_fast_rx[3], len);
 }
 
-static void wizchip_select(void) {
+/*
+ * Once s_hw is armed, EVERY access goes through the FIFO and the IDF driver
+ * never touches the peripheral again. Mixing does not survive on this IDF:
+ * after one direct-FIFO transfer, spi_device_polling_transmit() permanently
+ * returned zeros on RX (VERSIONR 0x00 via driver, 0x04 via FIFO; bench,
+ * 2026-08-13). Frames larger than the 64-byte FIFO are clocked as multiple
+ * bursts with CS held low across the frame, which VDM permits (the data
+ * phase is delimited by CS, not transaction boundaries).
+ */
+static void w5500_fifo_frame(uint32_t addrsel, bool write,
+                             const uint8_t* wbuf, uint8_t* rbuf, uint16_t len) {
+  const uint16_t head = len > (uint16_t)W5K_FAST_MAX ? (uint16_t)W5K_FAST_MAX : len;
+  s_fast_tx[0] = (uint8_t)((addrsel & 0x00FF0000) >> 16);
+  s_fast_tx[1] = (uint8_t)((addrsel & 0x0000FF00) >> 8);
+  s_fast_tx[2] = (uint8_t)((addrsel & 0x000000F8) | (write ? 0x04 : 0x00));
+  if (write) memcpy(&s_fast_tx[3], wbuf, head);
+  else       memset(&s_fast_tx[3], 0xFF, head);
+
+  w5k_cs_low();
+  w5k_fifo_xfer((uint16_t)(head + 3), !write);
+  if (!write) memcpy(rbuf, &s_fast_rx[3], head);
+
+  uint16_t off = head;
+  while (off < len) {
+    uint16_t take = (uint16_t)(len - off);
+    if (take > 64) take = 64;
+    if (write) memcpy(s_fast_tx, wbuf + off, take);
+    else       memset(s_fast_tx, 0xFF, take);
+    w5k_fifo_xfer(take, !write);
+    if (!write) memcpy(rbuf + off, s_fast_rx, take);
+    off = (uint16_t)(off + take);
+  }
+  w5k_cs_high();
+}
+
+extern "C" void w5500_bus_wr(uint32_t addrsel, const uint8_t* buf, uint16_t len) {
+  if (!g_spi_handle || !buf || len == 0) return;
+  if (s_hw) {
+    w5500_fifo_frame(addrsel, true, buf, nullptr, len);
+    return;
+  }
+  if ((uint32_t)len + 3 > W5K_FRAME_MAX) {   /* unreachable: max is 3 + 2048 */
+    ESP_LOGE(TAG, "W5500 frame %u exceeds buffer — write dropped", len + 3);
+    return;
+  }
+  s_frame_tx[0] = (uint8_t)((addrsel & 0x00FF0000) >> 16);
+  s_frame_tx[1] = (uint8_t)((addrsel & 0x0000FF00) >> 8);
+  s_frame_tx[2] = (uint8_t)((addrsel & 0x000000F8) | 0x04);   /* RWB=1, VDM */
+  memcpy(&s_frame_tx[3], buf, len);
+  spi_transaction_t t = {};
+  t.length = (size_t)(len + 3) * 8;
+  t.tx_buffer = s_frame_tx;
+  g_w5k_txns = g_w5k_txns + 1; g_w5k_bytes = g_w5k_bytes + len + 3;
   g_w5k_sels = g_w5k_sels + 1;
-  if (g_cs_pin >= 0) {
-    gpio_set_level((gpio_num_t)g_cs_pin, 0);
+  w5k_cs_low();
+  spi_device_polling_transmit(g_spi_handle, &t);
+  w5k_cs_high();
+}
+
+extern "C" void w5500_bus_rd(uint32_t addrsel, uint8_t* buf, uint16_t len) {
+  if (!buf || len == 0) return;
+  if (!g_spi_handle) {
+    memset(buf, 0, len);
+    return;
   }
-  s_frame_len = 0;
-}
-
-static void wizchip_deselect(void) {
-  w5k_flush_write();                 /* anything still buffered goes now */
-  if (g_cs_pin >= 0) {
-    gpio_set_level((gpio_num_t)g_cs_pin, 1);
+  if (s_hw) {
+    w5500_fifo_frame(addrsel, false, nullptr, buf, len);
+    return;
   }
-}
-
-static uint8_t wizchip_read(void) {
-  uint8_t rx_data = 0;
-  w5k_flush_read(&rx_data, 1);
-  return rx_data;
-}
-
-static void wizchip_write(uint8_t wb) {
-  if (s_frame_len < W5K_FRAME_MAX) {
-    s_frame_tx[s_frame_len++] = wb;
-  } else {
-    w5k_flush_write();
-    s_frame_tx[s_frame_len++] = wb;
+  if ((uint32_t)len + 3 > W5K_FRAME_MAX) {
+    ESP_LOGE(TAG, "W5500 frame %u exceeds buffer — read dropped", len + 3);
+    memset(buf, 0, len);
+    return;
   }
-}
-
-static void wizchip_readburst(uint8_t* pBuf, uint16_t len) {
-  if (pBuf && len > 0) w5k_flush_read(pBuf, len);
-}
-
-static void wizchip_writeburst(uint8_t* pBuf, uint16_t len) {
-  if (!pBuf || len == 0) return;
-  if (s_frame_len + len > W5K_FRAME_MAX) {
-    w5k_flush_write();
-    if (len > W5K_FRAME_MAX) {          /* oversized: straight to the wire */
-      spi_transaction_t t = {};
-      t.length = (size_t)len * 8;
-      t.tx_buffer = pBuf;
-      g_w5k_txns = g_w5k_txns + 1; g_w5k_bytes = g_w5k_bytes + len;
-      if (g_spi_handle) spi_device_polling_transmit(g_spi_handle, &t);
-      return;
-    }
-  }
-  memcpy(&s_frame_tx[s_frame_len], pBuf, len);
-  s_frame_len += len;
-  /*
-   * CONTROL TEST / correctness guard: flush this accessor's bytes immediately
-   * rather than accumulating until CS is deselected. CS is a manual GPIO held
-   * low for the whole frame, so per the W5500 datasheet's variable-length data
-   * mode (the data phase is delimited by CS, not by transaction boundaries)
-   * splitting a frame across transactions is legal. Deferring writes until
-   * deselect made a direct wiz_send_data() a no-op — Sn_TX_WR and Sn_TX_FSR
-   * both showed zero change — while the library's own send path still worked.
-   */
-  w5k_flush_write();
+  const uint16_t total = (uint16_t)(len + 3);
+  s_frame_tx[0] = (uint8_t)((addrsel & 0x00FF0000) >> 16);
+  s_frame_tx[1] = (uint8_t)((addrsel & 0x0000FF00) >> 8);
+  s_frame_tx[2] = (uint8_t)(addrsel & 0x000000F8);            /* RWB=0, VDM */
+  memset(&s_frame_tx[3], 0xFF, len);
+  spi_transaction_t t = {};
+  t.length = (size_t)total * 8;
+  t.rxlength = (size_t)total * 8;
+  t.tx_buffer = s_frame_tx;
+  t.rx_buffer = s_frame_rx;
+  g_w5k_txns = g_w5k_txns + 1; g_w5k_bytes = g_w5k_bytes + total;
+  g_w5k_sels = g_w5k_sels + 1;
+  w5k_cs_low();
+  spi_device_polling_transmit(g_spi_handle, &t);
+  w5k_cs_high();
+  memcpy(buf, &s_frame_rx[3], len);
 }
 
 
@@ -356,12 +327,12 @@ W5500Eth::~W5500Eth() {
 
 esp_err_t W5500Eth::begin(spi_host_device_t spiHost, int mosiPin, int misoPin, int sclkPin, int csPin, int intPin_, int rstPin_, int clockHz) {
   ESP_LOGI(TAG, "Initializing W5500 Ethernet...");
-  
+
   intPin = intPin_;
   rstPin = rstPin_;
   g_rst_pin = rstPin_;
   g_cs_pin = csPin;
-  
+
   gpio_config_t io_conf = {};
   io_conf.mode = GPIO_MODE_OUTPUT;
   io_conf.pin_bit_mask = (1ULL << csPin);
@@ -378,7 +349,7 @@ esp_err_t W5500Eth::begin(spi_host_device_t spiHost, int mosiPin, int misoPin, i
     gpio_config(&io_conf);
     gpio_set_level((gpio_num_t)rstPin, 1);
   }
-  
+
   spi_bus_config_t buscfg = {};
   buscfg.mosi_io_num = mosiPin;
   buscfg.miso_io_num = misoPin;
@@ -386,13 +357,13 @@ esp_err_t W5500Eth::begin(spi_host_device_t spiHost, int mosiPin, int misoPin, i
   buscfg.quadwp_io_num = -1;
   buscfg.quadhd_io_num = -1;
   buscfg.max_transfer_sz = 4092;
-  
+
   esp_err_t ret = spi_bus_initialize(spiHost, &buscfg, SPI_DMA_CH_AUTO);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
     return ret;
   }
-  
+
   spi_device_interface_config_t devcfg = {};
   devcfg.clock_speed_hz = clockHz;  // honor caller's requested SPI clock
   devcfg.mode = 0;
@@ -400,14 +371,14 @@ esp_err_t W5500Eth::begin(spi_host_device_t spiHost, int mosiPin, int misoPin, i
   devcfg.queue_size = 7;
   devcfg.command_bits = 0;
   devcfg.address_bits = 0;
-  
+
   ret = spi_bus_add_device(spiHost, &devcfg, &g_spi_handle);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Failed to add SPI device: %s", esp_err_to_name(ret));
     spi_bus_free(spiHost);
     return ret;
   }
-  
+
   w5k_bus_hold();
 
   if (rstPin >= 0) {
@@ -419,59 +390,52 @@ esp_err_t W5500Eth::begin(spi_host_device_t spiHost, int mosiPin, int misoPin, i
   } else {
     ESP_LOGW(TAG, "No reset pin configured - recommend connecting RST pin");
   }
-  
-  reg_wizchip_cs_cbfunc(wizchip_select, wizchip_deselect);
-  reg_wizchip_spi_cbfunc(wizchip_read, wizchip_write);
-  reg_wizchip_spiburst_cbfunc(wizchip_readburst, wizchip_writeburst);
-  
-  uint8_t memsize[8] = {2, 2, 2, 2, 2, 2, 2, 2};
-  if (wizchip_init(memsize, memsize) < 0) {
+
+  /* A single glitched SPI exchange must not cost the boot its network: the
+   * health watchdog lives in loop(), which never runs if begin() fails. */
+  int initRc = -1;
+  for (int attempt = 0; attempt < 3 && initRc != 0; ++attempt) {
+    if (attempt) vTaskDelay(pdMS_TO_TICKS(50));
+    initRc = w5500_chip_init();
+  }
+  if (initRc != 0) {
     ESP_LOGE(TAG, "W5500 initialization failed");
     spi_bus_remove_device(g_spi_handle);
     spi_bus_free(spiHost);
     g_spi_handle = nullptr;
     return ESP_FAIL;
   }
-  
+
   uint8_t version = 0;
   for (int i = 0; i < 3; ++i) {
-    version = getVERSIONR();
+    version = w5500_version();
     if (version == 0x04) break;
     vTaskDelay(pdMS_TO_TICKS(10));
   }
   ESP_LOGI(TAG, "W5500 version: 0x%02x (expected 0x04)", version);
 
-  /* Only now arm the direct-register reply path: wizchip_init() and the version
+  /* Only now arm the direct-register reply path: chip init and the version
    * reads above have gone through the driver, so the peripheral's per-transaction
    * configuration (line mode, dummy bits, MISO delay, cmd/addr lengths, keep-CS)
    * is established and the fast path can inherit it. */
   s_hw = SPI_LL_GET_HW(spiHost);
   ESP_LOGI(TAG, "W5500 reply path on direct SPI%d FIFO access", (int)spiHost + 1);
-  
+
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_STA);
   mac[0] = 0x02;
   memcpy(expectedMac, mac, 6);
+  w5500_set_mac(mac);
 
-  wiz_NetInfo netinfo = {};
-  memcpy(netinfo.mac, mac, 6);
-  netinfo.dhcp = NETINFO_DHCP;
-  wizchip_setnetinfo(&netinfo);
-  
-  wiz_PhyConf phyconf = {};
-  phyconf.by = PHY_CONFBY_SW;
-  phyconf.mode = PHY_MODE_AUTONEGO;
-  phyconf.speed = PHY_SPEED_100;
-  phyconf.duplex = PHY_DUPLEX_FULL;
-  wizphy_setphyconf(&phyconf);
-  
-  uint8_t phycfgr = getPHYCFGR();
-  ESP_LOGI(TAG, "PHYCFGR: 0x%02x (Link:%d Speed:%d Duplex:%d)", 
-           phycfgr, 
+  w5500_phy_autonego();
+
+  uint8_t phycfgr = w5500_rd8(W5500_CREG(W5500_PHYCFGR));
+  ESP_LOGI(TAG, "PHYCFGR: 0x%02x (Link:%d Speed:%d Duplex:%d)",
+           phycfgr,
            (phycfgr & 0x01) ? 1 : 0,
            (phycfgr & 0x02) ? 100 : 10,
            (phycfgr & 0x04) ? 1 : 0);
-  
+
   ESP_LOGI(TAG, "W5500 initialized successfully");
   return ESP_OK;
 }
@@ -482,29 +446,20 @@ esp_err_t W5500Eth::start(bool use_static_ip,
                          const char* static_netmask) {
   ESP_LOGI(TAG, "Starting Ethernet...");
 
-  wiz_NetInfo netinfo = {};
-  getSHAR(netinfo.mac);
-
   // Apply static config before waiting for link — the W5500 registers don't
   // need a live PHY, so a boot with the cable unplugged still ends up usable.
   if (use_static_ip && static_ip && static_gw && static_netmask) {
     uint8_t ip[4], gw[4], sn[4];
     if (parse_ip4(static_ip, ip) && parse_ip4(static_gw, gw) && parse_ip4(static_netmask, sn)) {
-      memcpy(netinfo.ip, ip, 4);
-      memcpy(netinfo.gw, gw, 4);
-      memcpy(netinfo.sn, sn, 4);
-      netinfo.dns[0] = netinfo.dns[1] = netinfo.dns[2] = netinfo.dns[3] = 0;
-      netinfo.dhcp = NETINFO_STATIC;
-      wizchip_setnetinfo(&netinfo);
-      wizchip_getnetinfo(&netinfo);
+      w5500_set_ipconf(ip, gw, sn);
       haveStatic = true;
       memcpy(staticIp4, ip, 4);
       memcpy(staticGw4, gw, 4);
       memcpy(staticSn4, sn, 4);
       ESP_LOGI(TAG, "Static IP: %d.%d.%d.%d  GW: %d.%d.%d.%d  SN: %d.%d.%d.%d",
-               netinfo.ip[0], netinfo.ip[1], netinfo.ip[2], netinfo.ip[3],
-               netinfo.gw[0], netinfo.gw[1], netinfo.gw[2], netinfo.gw[3],
-               netinfo.sn[0], netinfo.sn[1], netinfo.sn[2], netinfo.sn[3]);
+               ip[0], ip[1], ip[2], ip[3],
+               gw[0], gw[1], gw[2], gw[3],
+               sn[0], sn[1], sn[2], sn[3]);
     } else {
       ESP_LOGE(TAG, "Invalid static IP/gw/netmask, falling back to DHCP");
       use_static_ip = false;
@@ -515,7 +470,7 @@ esp_err_t W5500Eth::start(bool use_static_ip,
 
   int retry = 0;
   while (retry < 50) {
-    if (wizphy_getphylink() == PHY_LINK_ON) {
+    if (w5500_phy_link_up()) {
       linkUp = true;
       ESP_LOGI(TAG, "Ethernet link is up");
       break;
@@ -532,62 +487,58 @@ esp_err_t W5500Eth::start(bool use_static_ip,
 
   if (useDhcp) {
     ESP_LOGI(TAG, "Starting DHCP on W5500...");
-    DHCP_init(DHCP_SOCKET_NUM, s_dhcp_buf);
-    reg_dhcp_cbfunc(nullptr, nullptr, nullptr);
+    w5500_dhcp_init(DHCP_SOCKET_NUM);
 
     uint32_t elapsedMs = 0;
     uint32_t tickAccumMs = 0;
-    uint8_t dhcpState = DHCP_RUNNING;
+    w5500_dhcp_state_t dhcpState = W5500_DHCP_RUNNING;
     const uint32_t timeoutMs = 30000;
+    bool bound = false;
 
     while (elapsedMs < timeoutMs) {
       vTaskDelay(pdMS_TO_TICKS(100));
       elapsedMs += 100;
       tickAccumMs += 100;
       if (tickAccumMs >= 1000) {
-        DHCP_time_handler();
+        w5500_dhcp_tick_1s();
         tickAccumMs -= 1000;
       }
 
-      dhcpState = DHCP_run();
-      if (dhcpState == DHCP_IP_ASSIGN ||
-          dhcpState == DHCP_IP_CHANGED ||
-          dhcpState == DHCP_IP_LEASED) {
+      dhcpState = w5500_dhcp_run();
+      if (dhcpState == W5500_DHCP_ASSIGNED ||
+          dhcpState == W5500_DHCP_CHANGED ||
+          dhcpState == W5500_DHCP_LEASED) {
+        bound = true;
         break;
       }
-      if (dhcpState == DHCP_FAILED ||
-          dhcpState == DHCP_STOPPED) {
+      if (dhcpState == W5500_DHCP_FAILED) {
         break;
       }
     }
 
-    if (dhcpState == DHCP_IP_ASSIGN ||
-        dhcpState == DHCP_IP_CHANGED ||
-        dhcpState == DHCP_IP_LEASED) {
-      wizchip_getnetinfo(&netinfo);
-      ESP_LOGI(TAG, "DHCP acquired IP: %d.%d.%d.%d  GW: %d.%d.%d.%d  SN: %d.%d.%d.%d",
-               netinfo.ip[0], netinfo.ip[1], netinfo.ip[2], netinfo.ip[3],
-               netinfo.gw[0], netinfo.gw[1], netinfo.gw[2], netinfo.gw[3],
-               netinfo.sn[0], netinfo.sn[1], netinfo.sn[2], netinfo.sn[3]);
+    if (bound) {
+      uint8_t ip[4], gw[4], sn[4];
+      w5500_get_ip(ip);
+      w5500_get_gw(gw);
+      w5500_get_mask(sn);
+      ESP_LOGI(TAG, "DHCP acquired IP: %d.%d.%d.%d  GW: %d.%d.%d.%d  SN: %d.%d.%d.%d  lease: %us",
+               ip[0], ip[1], ip[2], ip[3],
+               gw[0], gw[1], gw[2], gw[3],
+               sn[0], sn[1], sn[2], sn[3],
+               (unsigned)w5500_dhcp_lease_seconds());
     } else {
-      ESP_LOGW(TAG, "DHCP failed (state=%d), falling back to static IP; DHCP keeps retrying in background", dhcpState);
+      ESP_LOGW(TAG, "DHCP failed (state=%d), falling back to static IP; DHCP keeps retrying in background", (int)dhcpState);
       uint8_t ip[4] = {192, 168, 1, 2};
       uint8_t sn[4] = {255, 255, 255, 0};
       uint8_t gw[4] = {192, 168, 1, 1};
-      uint8_t dns[4] = {0, 0, 0, 0};
-      memcpy(netinfo.ip, ip, 4);
-      memcpy(netinfo.sn, sn, 4);
-      memcpy(netinfo.gw, gw, 4);
-      memcpy(netinfo.dns, dns, 4);
-      netinfo.dhcp = NETINFO_STATIC;
-      wizchip_setnetinfo(&netinfo);
-      wizchip_getnetinfo(&netinfo);
+      w5500_set_ipconf(ip, gw, sn);
     }
   }
 
+  uint8_t mac[6];
+  w5500_get_mac(mac);
   ESP_LOGI(TAG, "MAC: %02x:%02x:%02x:%02x:%02x:%02x",
-           netinfo.mac[0], netinfo.mac[1], netinfo.mac[2],
-           netinfo.mac[3], netinfo.mac[4], netinfo.mac[5]);
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
   return ESP_OK;
 }
@@ -613,22 +564,21 @@ void W5500Eth::loop() {
   if (now - lastCheckUs < 1000000) return;   // ~1 Hz is plenty
   lastCheckUs = now;
 
-  bool chipOk = (getVERSIONR() == 0x04);      // SPI sanity — catches a wedged W5500
-  bool phyOk  = chipOk && (wizphy_getphylink() == PHY_LINK_ON);
+  bool chipOk = (w5500_version() == 0x04);    // SPI sanity — catches a wedged W5500
+  bool phyOk  = chipOk && w5500_phy_link_up();
   bool healthy = chipOk && phyOk;
 
   // A W5500 that spontaneously resets (power glitch) still answers SPI and
   // reads VERSIONR=4, but its register file is back to defaults — SHAR
-  // included. Left alone, the next DHCP_init() would see SHAR=0 and adopt
-  // ioLibrary's temporary MAC (00:08:dc:00:00:00), so the router hands out a
-  // brand-new lease and the server silently moves to a different IP without
-  // ever rebooting (2026-07-24 outage). Compare SHAR against the MAC we
+  // included. Left alone, DHCP would then run with SHAR=0, so the router hands
+  // out a brand-new lease and the server silently moves to a different IP
+  // without ever rebooting (2026-07-24 outage). Compare SHAR against the MAC we
   // programmed and rebuild the chip config in place when it's been lost.
   if (chipOk) {
     uint8_t shar[6];
-    getSHAR(shar);
+    w5500_get_mac(shar);
     if (memcmp(shar, expectedMac, 6) != 0) {
-      getSHAR(shar);   // reread — never act on a single glitched SPI transfer
+      w5500_get_mac(shar);   // reread — never act on a single glitched SPI transfer
       if (memcmp(shar, expectedMac, 6) != 0) {
         ESP_LOGE(TAG, "W5500 register loss (SHAR=%02x:%02x:%02x:%02x:%02x:%02x) — reinitializing chip in place",
                  shar[0], shar[1], shar[2], shar[3], shar[4], shar[5]);
@@ -647,25 +597,26 @@ void W5500Eth::loop() {
       // Cable replugged (possibly into a different network) — restart the DHCP
       // state machine so we reacquire instead of squatting on a stale lease.
       ESP_LOGI(TAG, "Link restored, restarting DHCP");
-      DHCP_init(DHCP_SOCKET_NUM, s_dhcp_buf);
+      w5500_dhcp_init(DHCP_SOCKET_NUM);
     }
     linkUp = healthy;
   }
 
   // Service the DHCP client at ~1 Hz. Renewal at T1, rebinding, and
-  // reacquisition after NAK all happen inside DHCP_run() — it just has to
-  // keep being called for the lifetime of the lease, not only at boot.
+  // reacquisition after NAK all happen inside w5500_dhcp_run() — it just has
+  // to keep being called for the lifetime of the lease, not only at boot.
   if (useDhcp && linkUp) {
-    DHCP_time_handler();
-    uint8_t st = DHCP_run();
-    if (st == DHCP_IP_ASSIGN || st == DHCP_IP_CHANGED) {
-      wiz_NetInfo ni = {};
-      wizchip_getnetinfo(&ni);
+    w5500_dhcp_tick_1s();
+    w5500_dhcp_state_t st = w5500_dhcp_run();
+    if (st == W5500_DHCP_ASSIGNED || st == W5500_DHCP_CHANGED) {
+      uint8_t ip[4], gw[4];
+      w5500_get_ip(ip);
+      w5500_get_gw(gw);
       ESP_LOGI(TAG, "DHCP %s: %d.%d.%d.%d  GW: %d.%d.%d.%d  lease: %us",
-               st == DHCP_IP_CHANGED ? "renewed (IP changed)" : "acquired",
-               ni.ip[0], ni.ip[1], ni.ip[2], ni.ip[3],
-               ni.gw[0], ni.gw[1], ni.gw[2], ni.gw[3],
-               (unsigned)getDHCPLeasetime());
+               st == W5500_DHCP_CHANGED ? "renewed (IP changed)" : "acquired",
+               ip[0], ip[1], ip[2], ip[3],
+               gw[0], gw[1], gw[2], gw[3],
+               (unsigned)w5500_dhcp_lease_seconds());
     }
   }
 
@@ -691,27 +642,12 @@ void W5500Eth::reinitChip() {
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 
-  uint8_t memsize[8] = {2, 2, 2, 2, 2, 2, 2, 2};
-  wizchip_init(memsize, memsize);
-
-  wiz_NetInfo netinfo = {};
-  memcpy(netinfo.mac, expectedMac, 6);
+  w5500_chip_init();
+  w5500_set_mac(expectedMac);
   if (haveStatic) {
-    memcpy(netinfo.ip, staticIp4, 4);
-    memcpy(netinfo.gw, staticGw4, 4);
-    memcpy(netinfo.sn, staticSn4, 4);
-    netinfo.dhcp = NETINFO_STATIC;
-  } else {
-    netinfo.dhcp = NETINFO_DHCP;
+    w5500_set_ipconf(staticIp4, staticGw4, staticSn4);
   }
-  wizchip_setnetinfo(&netinfo);
-
-  wiz_PhyConf phyconf = {};
-  phyconf.by = PHY_CONFBY_SW;
-  phyconf.mode = PHY_MODE_AUTONEGO;
-  phyconf.speed = PHY_SPEED_100;
-  phyconf.duplex = PHY_DUPLEX_FULL;
-  wizphy_setphyconf(&phyconf);
+  w5500_phy_autonego();
 }
 
 bool W5500Eth::isLinkUp() const {
@@ -719,17 +655,17 @@ bool W5500Eth::isLinkUp() const {
 }
 
 uint8_t W5500Eth::readVersion() const {
-  return getVERSIONR();   // 0x04 when healthy; anything else means the SPI link is wedged
+  return w5500_version();   // 0x04 when healthy; anything else means the SPI link is wedged
 }
 
 esp_err_t W5500Eth::getMacAddr(uint8_t mac[6]) const {
-  getSHAR(mac);
+  w5500_get_mac(mac);
   return ESP_OK;
 }
 
 bool W5500Eth::getIpAddr(uint32_t& ip) const {
   uint8_t ip_arr[4];
-  getSIPR(ip_arr);
+  w5500_get_ip(ip_arr);
   ip = (ip_arr[0] << 24) | (ip_arr[1] << 16) | (ip_arr[2] << 8) | ip_arr[3];
   return ip != 0;
 }

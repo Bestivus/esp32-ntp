@@ -18,19 +18,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
-// WIZnet's w5500.h (pulled in transitively by w5k_tcp_wrapper.h) #defines
-// SOCK_STREAM/SOCK_DGRAM as aliases for its own Sn_MR_TCP/Sn_MR_UDP constants,
-// with no include guard against them already being defined -- and lwip's
-// sockets.h above already defined them to the real POSIX values (1 and 2).
-// socket(AF_INET, SOCK_STREAM, 0) below needs the real lwip value, so hide it
-// only for WIZnet's header, then restore it immediately after.
-#pragma push_macro("SOCK_STREAM")
-#pragma push_macro("SOCK_DGRAM")
-#undef SOCK_STREAM
-#undef SOCK_DGRAM
 #include "w5k_tcp_wrapper.h"
-#pragma pop_macro("SOCK_DGRAM")
-#pragma pop_macro("SOCK_STREAM")
+#include "w5500_drv.h"
+#include "w5500_dhcp.h"
 
 // Liveness/boot diagnostics published by app_main (read-only here).
 extern volatile uint32_t g_mainLoopBeats;
@@ -327,6 +317,24 @@ void NtpStats::handleConnection() {
     "# HELP ntp_w5500_chip_resets_total W5500 register-loss events recovered in place (chip reset without a device reboot)\n"
     "# TYPE ntp_w5500_chip_resets_total counter\n"
     "ntp_w5500_chip_resets_total %" PRIu32 "\n"
+    "# HELP ntp_w5500_mgmt_spin_timeouts_total Bounded management-path register waits that expired (chip stopped acknowledging commands)\n"
+    "# TYPE ntp_w5500_mgmt_spin_timeouts_total counter\n"
+    "ntp_w5500_mgmt_spin_timeouts_total %" PRIu32 "\n"
+    "# HELP ntp_dhcp_lease_seconds Lease duration granted by the DHCP server\n"
+    "# TYPE ntp_dhcp_lease_seconds gauge\n"
+    "ntp_dhcp_lease_seconds %" PRIu32 "\n"
+    "# HELP ntp_dhcp_acks_total DHCP ACKs bound (acquisitions and renewals)\n"
+    "# TYPE ntp_dhcp_acks_total counter\n"
+    "ntp_dhcp_acks_total %" PRIu32 "\n"
+    "# HELP ntp_dhcp_naks_total DHCP NAKs received\n"
+    "# TYPE ntp_dhcp_naks_total counter\n"
+    "ntp_dhcp_naks_total %" PRIu32 "\n"
+    "# HELP ntp_dhcp_timeouts_total DHCP per-phase resend/expiry events\n"
+    "# TYPE ntp_dhcp_timeouts_total counter\n"
+    "ntp_dhcp_timeouts_total %" PRIu32 "\n"
+    "# HELP ntp_dhcp_renews_total Unicast renewal REQUESTs sent at T1\n"
+    "# TYPE ntp_dhcp_renews_total counter\n"
+    "ntp_dhcp_renews_total %" PRIu32 "\n"
     "# HELP ntp_gps_fix_quality GGA fix quality (0 none, 1 GPS, 2 DGPS, 4 RTK fix, 5 RTK float)\n"
     "# TYPE ntp_gps_fix_quality gauge\n"
     "ntp_gps_fix_quality %d\n"
@@ -440,7 +448,13 @@ void NtpStats::handleConnection() {
     ethLink,
     w5500Ver,
     chipResets,
-  
+    w5500_mgmt_spin_timeouts(),
+    w5500_dhcp_lease_seconds(),
+    w5500_dhcp_acks_total(),
+    w5500_dhcp_naks_total(),
+    w5500_dhcp_timeouts_total(),
+    w5500_dhcp_renews_total(),
+
     gs.fixQuality,
     gs.fixType,
     gs.satsUsed,
@@ -632,16 +646,16 @@ void NtpStats::handleConnection() {
     client_sock = -1;
   } else {
     // The W5500 socket TX buffer is 2KB; send in <=1KB chunks so a response
-    // larger than the buffer can't stall the ioLibrary send (it waits for
-    // SENDOK between chunks, so this is safe to chain).
+    // larger than the buffer chains cleanly through the driver's
+    // one-chunk-in-flight send.
     /*
-     * The ioLibrary's send() returns SOCK_BUSY (0) — not an error — whenever the
-     * PREVIOUS chunk has not reached SENDOK yet, and it does so regardless of
-     * blocking mode. Treating that as fatal silently truncated every response
-     * past the first chunk or two, which is why the body length varied with load
-     * while Content-Length stayed correct. Retry on 0, bail only on a negative
-     * return, and bound the whole thing in time so a dead peer cannot wedge the
-     * housekeeping slot.
+     * w5k_tcp_send() returns 0 (busy) — not an error — whenever the PREVIOUS
+     * chunk has not reached SENDOK yet or the TX buffer lacks room. Treating
+     * that as fatal silently truncated every response past the first chunk or
+     * two, which is why the body length varied with load while Content-Length
+     * stayed correct. Retry on 0, bail only on a negative return, and bound
+     * the whole thing in time so a dead peer cannot wedge the housekeeping
+     * slot.
      */
     int off = 0;
     const int64_t deadline = esp_timer_get_time() + 2000000;   /* 2 s */

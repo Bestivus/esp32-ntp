@@ -140,10 +140,10 @@ static void ntp_task(void* arg) {
 
     /*
      * Housekeeping shares this task deliberately. Every W5500 access funnels
-     * through one coalescing SPI shim with static frame buffers and the WIZnet
-     * library's critical-section hooks are no-ops, so a second task touching
-     * the chip corrupts transfers in flight. Serving from here keeps a single
-     * owner without a mutex the hot path would have to acquire per packet.
+     * through shared static frame buffers with no locking anywhere in the
+     * driver (w5500_drv.c relies on this), so a second task touching the chip
+     * corrupts transfers in flight. Serving from here keeps a single owner
+     * without a mutex the hot path would have to acquire per packet.
      */
     /* Time-gated, not sweep-counted: under a burst, packet rate must not drag
      * housekeeping SPI into the reply path. */
