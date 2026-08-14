@@ -32,6 +32,11 @@ self-contained one that runs directly on an ESP32.
   self-calibrating estimate of the W5500 send latency, so it reflects actual wire egress. This
   removes the systematic offset that otherwise makes a polled SPI MAC look hundreds of microseconds
   off.
+- **Calibrated serve path.** The default serve calibration is derived from measurement rather than
+  guessed: a GPS-disciplined observer on the same segment, hardware-timestamping both its own
+  transmit and receive, measured this firmware at -11.2 us and the calibration nulls it to within
+  about 100 ns. Re-derive it for your own build -- roughly 3 us of that figure is the 100 Mbit
+  W5500 against a gigabit observer, which is a property of the link, not of the board.
 - **Interleaved mode (RFC 9769).** A client that asks for it gets the *measured* transmit time of
   the previous reply instead of a predicted one, which takes the send path's per-packet variation
   out of the client's offset entirely. It is opt-in by the client and invisible to everyone else:
