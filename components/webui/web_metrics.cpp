@@ -38,6 +38,7 @@ void WebServer::sendMetrics() {
   uint32_t primeSkips = ntp ? ntp->getPrimeSkips() : 0;
   uint32_t capRejects = ntp ? ntp->getCapRejects() : 0;
   uint32_t lateOk = ntp ? ntp->getLateStampOk() : 0;
+  uint32_t ilServed = ntp ? ntp->getInterleavedServed() : 0;
   uint32_t lateFb = ntp ? ntp->getLateStampFallbacks() : 0;
   int lastStageRc = ntp ? ntp->getLastStageRc() : 0;
   int lastWrDelta = ntp ? ntp->getLastWrDelta() : 0;
@@ -100,6 +101,9 @@ void WebServer::sendMetrics() {
     "# HELP ntp_gps_holdover 1 when coasting on the oscillator (GPS lost, sync still credible)\n"
     "# TYPE ntp_gps_holdover gauge\n"
     "ntp_gps_holdover %d\n"
+    "# HELP ntp_interleaved_served_total Replies answered in interleaved mode (RFC 9769), carrying the measured transmit time of the previous reply instead of a predicted one\n"
+    "# TYPE ntp_interleaved_served_total counter\n"
+    "ntp_interleaved_served_total %" PRIu32 "\n"
     "# HELP ntp_tx_late_stamp_total Replies sent with t3 patched in place before SEND\n"
     "# TYPE ntp_tx_late_stamp_total counter\n"
     "# HELP ntp_tx_late_stamp_fallback_total Replies that fell back to the library send\n"
@@ -258,6 +262,7 @@ void WebServer::sendMetrics() {
     gs.ppsRejectCount,
     gs.nmeaMispairCount,
     gs.holdover ? 1 : 0,
+    ilServed,
     lateOk,
     lateFb,
     lastStageRc,

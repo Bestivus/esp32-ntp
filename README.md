@@ -32,6 +32,13 @@ self-contained one that runs directly on an ESP32.
   self-calibrating estimate of the W5500 send latency, so it reflects actual wire egress. This
   removes the systematic offset that otherwise makes a polled SPI MAC look hundreds of microseconds
   off.
+- **Interleaved mode (RFC 9769).** A client that asks for it gets the *measured* transmit time of
+  the previous reply instead of a predicted one, which takes the send path's per-packet variation
+  out of the client's offset entirely. It is opt-in by the client and invisible to everyone else:
+  a basic-mode client never sends a matching origin, so it sees byte-identical behaviour. Note the
+  honest limit -- this removes the *prediction* error, not the *timestamping* error. The reported
+  instant is when SEND was accepted, not a wire-egress capture, because `INTn` is level-asserted
+  and shared with RECV so a SENDOK edge cannot be attributed to a specific packet.
 - **Ethernet or Wi-Fi.** WIZnet W5500 (SPI) or Wi-Fi STA, switchable from the settings page. Same
   NTP server and metrics either way. The Wi-Fi path compiles itself out on parts with no radio, so
   the same source builds everywhere.
@@ -328,7 +335,8 @@ retry backs off 1 s, 2 s, then 4 s rather than waiting 4 s to notice.
 | `ntp_pps_count` | PPS edges received |
 | `ntp_pps_rejects_total` | PPS pulses rejected as outliers |
 | `ntp_rx_irq_total` | W5500 RX interrupts captured (hardware arrival edges) |
-| `ntp_tx_correction_us` | Self-calibrated transmit-path correction added to `t3` |
+| `ntp_tx_correction_us` | Self-calibrated transmit-path correction added to `t3` (basic mode only) |
+| `ntp_interleaved_served_total` | Replies answered in interleaved mode (RFC 9769) |
 | `ntp_reset_reason` | `esp_reset_reason()` of the last boot (1=power-on, 7=task WDT, 8=int WDT, 9=brownout) |
 | `ntp_boot_count` | Boots since flash (NVS-persisted, so a jump means it auto-recovered) |
 | `ntp_main_loop_beats` | Core-0 main-loop heartbeat |

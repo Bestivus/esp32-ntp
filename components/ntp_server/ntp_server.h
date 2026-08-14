@@ -20,6 +20,7 @@ public:
   uint32_t getCapRejects() const;
   uint32_t getRxIrqCount() const;
   uint32_t getLateStampOk() const;
+  uint32_t getInterleavedServed() const;
   uint32_t getLateStampFallbacks() const;
   int getLastStageRc() const;
   int getLastWrDelta() const;
