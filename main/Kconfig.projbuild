@@ -74,6 +74,59 @@ config APP_TZ
     help
         POSIX TZ string, e.g. "EST5EDT,M3.2.0,M11.1.0".
 
+comment "MQTT (Home Assistant)"
+
+config APP_MQTT_ENABLE
+    bool "Enable MQTT publishing"
+    default n
+    depends on APP_NETWORK_WIZNET
+    help
+        Publishes GPS/NTP status to an MQTT broker with Home Assistant discovery.
+        Ethernet only -- runs on the W5500's own hardware TCP/IP stack, same as
+        the NTP server and stats endpoint.
+
+config APP_MQTT_BROKER_IP
+    string "MQTT broker IPv4 address"
+    default ""
+    depends on APP_MQTT_ENABLE
+    help
+        Dotted IPv4 address only. The W5500's onboard TCP/IP stack has no DNS.
+
+config APP_MQTT_BROKER_PORT
+    int "MQTT broker port"
+    range 1 65535
+    default 1883
+    depends on APP_MQTT_ENABLE
+
+config APP_MQTT_USERNAME
+    string "MQTT username (optional)"
+    default ""
+    depends on APP_MQTT_ENABLE
+
+config APP_MQTT_PASSWORD
+    string "MQTT password (optional)"
+    default ""
+    depends on APP_MQTT_ENABLE
+
+config APP_MQTT_CLIENT_ID
+    string "MQTT client ID"
+    default "esp32-ntp"
+    depends on APP_MQTT_ENABLE
+
+config APP_MQTT_NODE_ID
+    string "MQTT/HA node ID (topic prefix)"
+    default "esp32ntp"
+    depends on APP_MQTT_ENABLE
+    help
+        Used as the MQTT topic prefix and the Home Assistant device identifier.
+        Must be safe to use as an MQTT topic segment (no '/', '+', '#', spaces).
+
+config APP_MQTT_PUBLISH_INTERVAL_S
+    int "Status publish interval (seconds)"
+    range 5 3600
+    default 30
+    depends on APP_MQTT_ENABLE
+
 comment "SPI / Display"
 
 config APP_USE_DISPLAY

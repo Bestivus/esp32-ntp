@@ -7,6 +7,10 @@ int w5k_tcp_listen(uint8_t socket_num, uint16_t port) {
   return w5500_tcp_listen(socket_num, port);
 }
 
+int w5k_tcp_connect(uint8_t socket_num, const uint8_t ip[4], uint16_t port) {
+  return w5500_tcp_connect(socket_num, ip, port);
+}
+
 uint8_t w5k_tcp_status(uint8_t socket_num) {
   return w5500_sock_status(socket_num);
 }
@@ -21,4 +25,8 @@ int32_t w5k_tcp_send(uint8_t socket_num, const uint8_t* buf, uint16_t len) {
 
 int w5k_tcp_disconnect(uint8_t socket_num) {
   return w5500_tcp_discon(socket_num);
+}
+
+int w5k_tcp_close(uint8_t socket_num) {
+  return w5500_sock_close(socket_num);
 }

@@ -63,6 +63,7 @@ void w5500_bus_wr(uint32_t addrsel, const uint8_t* buf, uint16_t len);
 
 #define W5500_CR_OPEN       0x01
 #define W5500_CR_LISTEN     0x02
+#define W5500_CR_CONNECT    0x04
 #define W5500_CR_DISCON     0x08
 #define W5500_CR_CLOSE      0x10
 #define W5500_CR_SEND       0x20
@@ -115,6 +116,11 @@ int32_t  w5500_udp_sendto(uint8_t sn, const uint8_t* buf, uint16_t len,
 int32_t  w5500_udp_recvfrom(uint8_t sn, uint8_t* buf, uint16_t len,
                             uint8_t from_ip[4], uint16_t* from_port);
 int      w5500_tcp_listen(uint8_t sn, uint16_t port);   /* 0 ok, -1 open failed, -2 listen failed */
+/* Open a socket and issue a non-blocking outbound connect. Returns 0 once the
+ * connect command was accepted (caller polls w5500_sock_status() for
+ * W5500_SR_ESTABLISHED), -1 if the socket couldn't even be opened/the connect
+ * command wasn't accepted. Never blocks on the actual TCP handshake. */
+int      w5500_tcp_connect(uint8_t sn, const uint8_t ip[4], uint16_t port);
 int32_t  w5500_tcp_recv(uint8_t sn, uint8_t* buf, uint16_t len);
 /* Returns len once staged, 0 while the previous chunk is unacknowledged or
  * the TX buffer lacks room (never spins on the peer), <0 when the connection

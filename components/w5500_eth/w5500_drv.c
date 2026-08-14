@@ -220,6 +220,28 @@ int w5500_tcp_listen(uint8_t sn, uint16_t port) {
   return 0;
 }
 
+int w5500_tcp_connect(uint8_t sn, const uint8_t ip[4], uint16_t port) {
+  /* Ephemeral local port, varied on every call rather than fixed per socket
+   * number: reusing the exact same 4-tuple across reconnect attempts can
+   * collide with a still-lingering connection-tracking entry for the
+   * PREVIOUS attempt in an intermediate stateful firewall, which silently
+   * drops the new SYN until that stale entry finally expires -- observed on
+   * real hardware as several fully-silent connect cycles in a row, then one
+   * that got through immediately, repeating. */
+  static uint16_t s_ephemeral = 0;
+  uint16_t myport = (uint16_t)(20000 + sn + (uint16_t)(s_ephemeral++ % 1000));
+  if (sock_open(sn, W5500_SN_MR_TCP, myport, W5500_SR_INIT) != 0) return -1;
+  w5500_bus_wr(W5500_SREG(sn, W5500_SN_DIPR), ip, 4);
+  w5500_wr16(W5500_SREG(sn, W5500_SN_DPORT), port);
+  w5500_sock_set_nonblock(sn, true);
+  w5500_wr8(W5500_SREG(sn, W5500_SN_CR), W5500_CR_CONNECT);
+  if (!spin_cr_clear(sn, 5000)) {
+    w5500_sock_close(sn);
+    return -1;
+  }
+  return 0;
+}
+
 int32_t w5500_tcp_recv(uint8_t sn, uint8_t* buf, uint16_t len) {
   uint16_t rsr = w5500_rd16(W5500_SREG(sn, W5500_SN_RX_RSR));
   if (rsr == 0) return 0;
