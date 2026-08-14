@@ -1,0 +1,29 @@
+# Curated defaults for this fork's hardware/build. Deliberately NOT a full
+# `idf.py save-defconfig` snapshot -- see the PR review comment that asked
+# for exactly that distinction: list changes one by one so each can be
+# reviewed on its own, rather than dumping a whole local sdkconfig (which
+# would carry this machine's static IP, NTP server, and MQTT broker
+# credentials into a public repo).
+#
+# No network address, hostname, or credential belongs in this file. If a
+# future setting needs one, it stays local-only in the gitignored sdkconfig.
+
+# No display attached to this board.
+CONFIG_APP_USE_DISPLAY=n
+
+# Default to DHCP, not a half-configured static IP with no address set.
+CONFIG_APP_USE_STATIC_IP=n
+
+# This is a microsecond-precision time server; a debug build measurably
+# changes ISR/SPI timing. Match upstream's own committed default (-O2).
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Fixes a real bug: pdMS_TO_TICKS(5) rounds to 0 ticks (= don't block at all)
+# at the 100Hz default, which starved the idle task and caused a Task
+# Watchdog reset roughly every 5s. See CLAUDE.md Part 3.
+CONFIG_FREERTOS_HZ=1000
+
+# Example only, in POSIX TZ format -- change this to your own location.
+# Left in as a template since the format isn't obvious otherwise; the value
+# itself is not a real deployment detail worth hiding.
+CONFIG_APP_TZ="EST5EDT,M3.2.0,M11.1.0"
