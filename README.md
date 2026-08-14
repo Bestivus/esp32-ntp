@@ -3,26 +3,37 @@
 This is a fork of [dniminenn/esp32-ntp](https://github.com/dniminenn/esp32-ntp) - a genuinely
 excellent piece of engineering, and huge thanks to dniminenn for open-sourcing it. Everything below
 this section is the upstream project as-is; here's what changed while bringing it up on my own
-hardware. Most of it has been submitted back upstream as PRs.
+hardware.
 
-- **ESP-IDF v6.0.2 support** ([PR #2](https://github.com/dniminenn/esp32-ntp/pull/2)): fixed
-  eight build errors from ESP-IDF v6.0's driver-component reorganization and stricter
-  warnings-as-errors, plus a runtime bug where a FreeRTOS tick-rate rounding issue turned an
-  intended 5ms wait into an unthrottled busy-loop, causing a task-watchdog reset roughly every 5
-  seconds.
-- **Two Kconfig bug fixes** ([PR #1](https://github.com/dniminenn/esp32-ntp/pull/1)): the
-  timezone setting (`APP_TZ`) was never actually read from Kconfig, and disabling the display in
-  menuconfig broke the build.
+An earlier version of this fork carried its own ESP-IDF v6.0.2 build fixes and two Kconfig bug
+fixes (timezone, display), submitted upstream as PRs. Upstream has since landed its own rewrite -
+a first-party W5500 driver replacing the vendored `ioLibrary_Driver`, and an NVS-backed settings
+system replacing direct Kconfig reads - which fixes both of those problems natively and makes the
+old patches moot. This branch is rebased onto that current upstream code rather than carrying
+now-obsolete fixes forward.
+
+- **Dropped the forked `ioLibrary_Driver` submodule.** This fork previously carried a patched
+  submodule solely to fix a `recv()` bug where the non-blocking-mode check fired before the
+  data-available check, so a non-blocking TCP socket could never actually read data. Upstream's
+  new `w5500_drv` fixes this natively, so the fork and the patch are both gone.
 - **3D-printed enclosure** ([PR #3](https://github.com/dniminenn/esp32-ntp/pull/3), see
   [`hardware/enclosure/`](hardware/enclosure/)): a two-piece, magnet-held case sized for this
   exact build (D1 Mini ESP32 + W5500 + SparkFun MAX-M10S GPS), STEP and STL included.
 - **MQTT status publishing with Home Assistant discovery** (`components/mqtt_publish/`, kept in
   this fork only): publishes GPS lock, stratum, offset, jitter, and diagnostics to an MQTT broker
-  with HA auto-discovery, via a hand-rolled non-blocking state machine so it can never delay an
-  NTP reply.
+  with HA auto-discovery. Re-implemented from scratch as a hand-rolled, zero-dependency MQTT 3.1.1
+  wire codec running on upstream's `w5500_drv`, since the previous implementation leaned on
+  Paho MQTT-C code pulled from the now-dropped `ioLibrary_Driver`. Still a non-blocking,
+  tick-driven state machine polled from the NTP task's housekeeping slot, at most one socket call
+  per tick, so it can never delay a PPS capture or an NTP reply.
+- **`sdkconfig.defaults`** instead of a committed full `sdkconfig`: lists this fork's build-time
+  differences from upstream's defaults individually (no display attached, `-O2` build, the
+  FreeRTOS tick-rate fix), rather than a full local config snapshot that would carry this
+  machine's network settings and credentials into the repo.
 
-The full technical write-up - root causes, debugging process, everything found and fixed - is in
-[`CLAUDE.md`](CLAUDE.md).
+The full technical write-up for the original v6.0.2 migration - root causes, debugging process,
+everything found and fixed on the code this fork has since moved on from - is in
+[`CLAUDE.md`](CLAUDE.md), kept as history.
 
 ---
 
