@@ -215,16 +215,8 @@ esptool --port /dev/ttyUSB0 erase-region 0x9000 0x6000
 
 That takes every stored setting with it and the device returns to build-time defaults.
 
-Saving the lock requires a password to already be set. Be clear about what that does and does
-not buy: it guards against fusing the device by accident, and it is not a security control.
-Anyone who can reach an unprotected settings page can set the password and the fuse in the same
-request, and post-fuse the password gates nothing, because the page is gone and `/metrics` was
-always open.
-
-The real control is the network. An unprotected settings page means whoever can reach it owns
-the device, fuse included. Set a password, or keep the management port off any network you do
-not trust. If you want a lock that survives a hostile actor on the network, it has to require
-physical presence, which this does not.
+Locking needs a password set first, which only stops you doing it by accident. Anyone who can
+reach an unprotected page owns the device, fuse included.
 
 ### If a setting makes the device unreachable
 
