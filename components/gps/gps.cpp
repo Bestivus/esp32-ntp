@@ -15,7 +15,6 @@ static const char* TAG = "GPS";
 // oscillator. We keep claiming sync (stratum 1) while the predicted error
 // stays bounded, with root dispersion growing to tell clients honestly.
 static const int64_t kFreshPpsUs = 2500000;            // disciplining considered live within 2.5s of a good PPS
-static const double  kHoldoverDriftFloorPpm = 1.0;     // assume >=1ppm drift in holdover (temperature dominates)
 /*
  * While disciplined, dispersion must grow at the rate our frequency estimate
  * could be WRONG, not at the raw frequency error. The fit measures the crystal
@@ -27,6 +26,25 @@ static const double  kHoldoverDriftFloorPpm = 1.0;     // assume >=1ppm drift in
 static const double  kDisciplinedDriftPpm = 0.1;
 static const double  kHoldoverMaxDispersionSec = 0.01; // drop the lock once predicted error exceeds 10ms
 static const int64_t kHoldoverMaxUs = 3600LL * 1000000LL; // ...or after 1 hour, whichever first
+/*
+ * Holdover error model.
+ *
+ * The same argument as kDisciplinedDriftPpm above, carried into holdover: the
+ * crystal's ~27ppm offset is COMPENSATED, and the compensation keeps being
+ * applied while coasting. What degrades is not that offset but the rate at
+ * which the frozen estimate goes stale, which is the frequency drift.
+ *
+ * Measured on this hardware over five days: 0.075 ppm/h median, 0.42 ppm/h at
+ * p95, dominated by a 1.04 ppm peak-to-peak diurnal cycle that peaks
+ * mid-afternoon. statFreqDriftPerSec already measures it live.
+ *
+ * Error therefore grows in two terms, not one. The estimate is already wrong by
+ * drift x kFreqEstLagSec at the moment GPS is lost (a linear fit over kFitWin
+ * lags a ramp by half its window, and the EWMA on top adds ~1/alpha samples),
+ * and it keeps going wrong, which integrates to the quadratic term.
+ */
+static const double  kFreqEstLagSec = 140.0;              // kFitWin/2 + 1/alpha
+static const double  kHoldoverDriftFloorPpmPerHour = 0.5; // never claim better than this
 
 static uint32_t unix_to_ntp_seconds(time_t unixSec) {
   return (uint32_t)((uint64_t)unixSec + 2208988800ULL);
@@ -941,17 +959,26 @@ double GpsDiscipline::getRootDispersion() const {
   // Grow from the last *disciplined* pulse (not merely the last PPS edge), so
   // holdover — GPS pulsing without valid NMEA included — is reported honestly.
   double sinceGoodSec = (double)(esp_timer_get_time() - lastGoodPpsUs) / 1e6;
-  double driftPpm = kDisciplinedDriftPpm;
-  // The calibrated estimate only holds near the calibration temperature; once
-  // coasting, revert to the raw frequency error floored so dispersion doesn't
-  // stay optimistic. Holdover semantics are unchanged: isLocked() drops the
-  // lock off this same value.
-  if (sinceGoodSec > (double)kFreshPpsUs / 1e6)
-    driftPpm = fmax(fabs(filteredFrequencyPpm), kHoldoverDriftFloorPpm);
-  // Use filtered (outlier-immune) RMS and frequency for stable dispersion
-  // NTP 16.16 fixed point formatting truncates values below 1/65536 (~15.25µs) to 0.
-  // We use a floor of 16µs so dispersion doesn't report as 0.000000.
-  return fabs(filteredRmsOffsetSec) + driftPpm * 1e-6 * sinceGoodSec + 16e-6;
+
+  // NTP 16.16 fixed point truncates below 1/65536 (~15.25us) to 0, so a 16us
+  // floor keeps dispersion from advertising as exactly 0.000000.
+  if (sinceGoodSec <= (double)kFreshPpsUs / 1e6)
+    return fabs(filteredRmsOffsetSec) + kDisciplinedDriftPpm * 1e-6 * sinceGoodSec + 16e-6;
+
+  /*
+   * Holdover: grow at the rate the frequency ESTIMATE goes wrong, not at the
+   * crystal's raw offset. Using the raw offset here claimed ~27.7ppm of drift
+   * against a measured 0.075ppm/h, which tripped the 10ms ceiling after 360s
+   * and made kHoldoverMaxUs unreachable dead code -- the device gave up after
+   * six minutes of a holdover budgeted for an hour, while its real error at
+   * that point was about 2us.
+   */
+  double driftPpmPerSec = fmax(fabs(statFreqDriftPerSec) * 1e6,
+                               kHoldoverDriftFloorPpmPerHour / 3600.0);
+  double freqErrPpm = driftPpmPerSec * kFreqEstLagSec;
+  double growSec = freqErrPpm * 1e-6 * sinceGoodSec
+                 + 0.5 * driftPpmPerSec * 1e-6 * sinceGoodSec * sinceGoodSec;
+  return fabs(filteredRmsOffsetSec) + growSec + 16e-6;
 }
 
 bool GpsDiscipline::isLocked() const {
