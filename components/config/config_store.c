@@ -126,7 +126,9 @@ const cfg_field_t g_cfg_fields[CFG_COUNT] = {
                        .imin=0, .imax=1, .idef=0,
                        .help="One way. Saving this removes the settings page for good; only erasing "
                              "the NVS partition over USB brings it back. Metrics keep working. "
-                             "Requires a password to be set." },
+                             "A password must be set first, which guards against fusing this by "
+                             "accident, not against anyone hostile: whoever can reach an "
+                             "unprotected page can set the password and the fuse in one request." },
 
   [CFG_DISP_EN]    = { .key="disp.en", .label="Enable display", .group="Display", .type=CF_BOOL,
                        .imin=0, .imax=1, .idef=DEF_DISP_EN, .reboot=true },
