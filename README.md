@@ -2,108 +2,54 @@
 
 **Writeup:** [Building a GPS stratum 1 NTP server on an ESP32](https://dnim.dev/blog/esp32-stratum-1-ntp)
 
-Turn an ESP32 and a cheap GPS module into a **Stratum 1 NTP time server** that hands out
-sub-microsecond-grade time over **Ethernet (WIZnet W5500)** or **Wi-Fi**. PPS edges from the
-GPS are captured in hardware, so the clock is disciplined with nanosecond resolution and no
-interrupt jitter, and packet timestamps are taken in hardware too, so what clients see on the
-wire is just as tight.
+An ESP32 plus a cheap GPS module, serving Stratum 1 NTP over Ethernet (WIZnet W5500) or
+Wi-Fi. PPS edges are captured by the MCPWM peripheral in silicon and packet arrival is
+timestamped off the W5500 interrupt, so neither the discipline nor the served timestamps
+depend on when a poll loop noticed.
 
-If you've ever wanted your own GPS time server, a `chrony`/`ntpd` upstream that doesn't depend
-on the public NTP pool, or a self-hosted Stratum 1 reference clock on your LAN, this is a small,
-self-contained one that runs directly on an ESP32.
+Configuration lives in flash and is edited from a page the device serves itself, so a
+deployed clock needs no rebuild and no serial cable. See [Configuration](#configuration).
 
-> **Status:** runs unattended for days, self-recovers from faults, and posts sub-microsecond
-> served jitter on a wired LAN (numbers and the honest caveats are below).
+## What it does
 
----
+- **Stratum 1 from GPS + PPS.** No internet or upstream server once the GPS has a fix.
+- **Hardware timestamping both ways.** MCPWM capture for PPS (12.5 ns resolution at
+  80 MHz), W5500 `INTn` capture for NTP arrival.
+- **Interleaved mode (RFC 9769).** Clients that ask for it get the measured transmit time
+  of the previous reply rather than a predicted one. Invisible to clients that do not.
+- **Ethernet or Wi-Fi**, switchable at runtime. The Wi-Fi path compiles out on parts with
+  no radio.
+- **Settings in flash, edited from a browser**, with a permanent lock for deployment and a
+  recovery path if a setting locks you out.
+- **Prometheus metrics** at `GET /metrics`.
+- **Self-healing:** task watchdog reboots on a hang, and a W5500 health check restarts the
+  device if the network chip wedges.
+- **Optional MAX7219 LED display.**
 
-## Highlights
+## Accuracy
 
-- **Stratum 1 over GPS + PPS.** Time is steered by a PI servo locked to the GPS pulse-per-second
-  signal. No internet, no SNTP, no upstream server needed once the GPS has a fix.
-- **Hardware PPS capture (MCPWM).** The ESP32's MCPWM capture peripheral latches a counter at the
-  exact PPS GPIO edge in silicon: 12.5 ns resolution (80 MHz APB clock), zero ISR-latency jitter.
-  The servo, jitter estimator, and outlier rejection all run on hardware-captured ticks.
-- **Hardware RX timestamping (W5500 interrupt capture).** Incoming NTP requests are timestamped the
-  instant they arrive. The W5500's `INTn` line fires a GPIO interrupt that latches a monotonic
-  timestamp, so the receive time (`t2`) reflects true arrival instead of when a poll loop noticed.
-  It's the same "capture in hardware, not in software" idea as the PPS path.
-- **Transmit-timestamp correction.** The reply's transmit time (`t3`) is pre-corrected by a
-  self-calibrating estimate of the W5500 send latency, so it reflects actual wire egress. This
-  removes the systematic offset that otherwise makes a polled SPI MAC look hundreds of microseconds
-  off.
-- **Calibrated serve path.** The default serve calibration is derived from measurement rather than
-  guessed: a GPS-disciplined observer on the same segment, hardware-timestamping both its own
-  transmit and receive, measured this firmware at -11.2 us and the calibration nulls it to within
-  about 100 ns. Re-derive it for your own build -- roughly 3 us of that figure is the 100 Mbit
-  W5500 against a gigabit observer, which is a property of the link, not of the board.
-- **Interleaved mode (RFC 9769).** A client that asks for it gets the *measured* transmit time of
-  the previous reply instead of a predicted one, which takes the send path's per-packet variation
-  out of the client's offset entirely. It is opt-in by the client and invisible to everyone else:
-  a basic-mode client never sends a matching origin, so it sees byte-identical behaviour. Note the
-  honest limit -- this removes the *prediction* error, not the *timestamping* error. The reported
-  instant is when SEND was accepted, not a wire-egress capture, because `INTn` is level-asserted
-  and shared with RECV so a SENDOK edge cannot be attributed to a specific packet.
-- **Ethernet or Wi-Fi.** WIZnet W5500 (SPI) or Wi-Fi STA, switchable from the settings page. Same
-  NTP server and metrics either way. The Wi-Fi path compiles itself out on parts with no radio, so
-  the same source builds everywhere.
-- **Settings in flash, edited from a browser.** Network, timezone, display and every wiring pin are
-  stored in NVS and changed from a page the device serves itself, no rebuild and no serial cable.
-  Risky settings are gated behind a disclosure, values are validated before they are written, and
-  interrupting startup twice brings the third boot up on the build-time defaults if a change ever
-  locks you out. When you are done configuring, the settings page can be **fused off for good**, so
-  a deployed clock exposes nothing but NTP and metrics.
-- **Prometheus metrics over HTTP** at `GET /metrics`: lock state, offset, jitter, frequency, and a
-  full set of health and diagnostics counters.
-- **Self-healing for unattended use.** A hardware watchdog reboots on any firmware hang, and a
-  W5500 health watchdog restarts the device if the network chip wedges, so it recovers on its own
-  with no serial console attached.
-- **Optional LED matrix display** (MAX7219) showing the current time, with a top-row binary uptime
-  ticker.
+Measured against independent GPS references on the same LAN. Two figures matter and they
+are different things:
 
-## Measured performance
+| | |
+|---|---|
+| Internal discipline (against its own PPS) | single-digit ns offset, 7 to 11 ns PPS jitter |
+| Served time (what a client actually sees) | tens of us, dominated by the network path |
 
-On a wired LAN, judged by a `chrony` instance on a separate wired host:
+The gap between those two is not the clock. It is the W5500 at 100 Mbit and whatever sits
+between the board and the client. A gigabit observer one switch away measured this
+firmware at -11.2 us before calibration and within about 100 ns after, with roughly 3 us of
+that figure attributable to the 100 Mbit to gigabit speed transition rather than to the
+board.
 
-- **Internal discipline:** last offset around a few ns, RMS offset around 16 ns, PPS jitter around
-  7 to 11 ns, zero PPS outliers rejected over tens of thousands of pulses.
-- **As a served time source:** per-sample jitter (sigma) around 0.6 to 2.6 us, root distance around
-  35 to 65 us, offset within a few tens of us. That was tight enough that `chrony` happily
-  **selected the ESP32** alongside other GPS Stratum 1 references, including an Intel i210 plus
-  u-blox NEO-M9N PTP grandmaster.
+Independent cross-checks: an Intel i210 plus NEO-M9N PTP grandmaster, measuring the ESP32
+one routed hop away with its own NIC hardware timestamping, saw about 60 us of offset and
+10 to 25 us of per-sample jitter. Separately, in a four-clock ensemble (two NIC-PHC clocks,
+a BeagleBone PRU clock and this ESP32), three chrony observers each running full source
+selection accept the ESP32 as a truechimer against the other three.
 
-One honest caveat on that comparison: the measuring host was on the same subnet as the ESP32, while
-the grandmaster sat one routed hop away. That extra hop inflates the grandmaster's measured delay
-and root distance, so this is not an apples-to-apples "beats a grandmaster" result. Read it as the
-ESP32 being genuinely in the same class as serious GPS Stratum 1 hardware from where the client was
-sitting, not as proof it is more accurate than a PTP grandmaster.
-
-### Cross-checked by the grandmaster itself
-
-The cleaner test runs the comparison the other way around. The i210 plus NEO-M9N grandmaster, using
-its own NIC hardware timestamping and interleaved NTP, measures the ESP32 directly. Now the ESP32 is
-the source a routed hop away, so the result is conservative rather than flattering.
-
-Seen from the grandmaster, the ESP32 tracks it to within about 60 us of offset (across that one
-routed hop), with per-sample jitter on the order of 10 to 25 us, reach 377, and a near-zero
-frequency skew. That jitter floor is the ESP32's W5500 and the network path, not the GPS discipline,
-which holds to nanoseconds internally. In other words, an independent GPS PTP grandmaster sees the
-ESP32 agreeing with it at the tens-of-microseconds level over the LAN, which is what validates the
-served time as accurate, not merely internally precise.
-
-Your numbers will depend on antenna placement, GPS module, wiring, and network topology, but the
-takeaway holds: the limit is your GPS and your network path, not the ESP32.
-
-### Still true months later, in an ensemble
-
-A later spot check (2026-08), after months of unattended operation: the same unit now serves as one
-of four independently implemented, hardware-timestamped GPS stratum 1 clocks on a LAN (two NIC-PHC
-clocks disciplined by ts2phc, one BeagleBone PRU clock, and this ESP32). Three separate chrony
-observers each run the full source-selection algorithm across all four. On every observer the ESP32
-is accepted as a truechimer (its error interval overlaps the other three clocks' intervals), sitting
-around -54 us offset with about 31 us of per-sample jitter from the nearest observer. That is the
-same envelope the grandmaster measured at publication, reproduced live by chrony's intersection
-algorithm against three independent clocks rather than by a one-off measurement campaign.
+Your numbers depend on your GPS, your antenna, your wiring and your network. The limit is
+almost always one of those rather than the ESP32.
 
 ## Hardware
 
@@ -279,6 +225,90 @@ why. Your stored values are still in flash and are not touched; saving from that
 them, and any restart that reaches the network clears the condition on its own.
 
 **Erase stored settings** at the bottom of the page wipes everything back to build-time defaults.
+
+### Settings reference
+
+Every runtime setting, generated from the single table in
+`components/config/config_store.c`. **R** means the change takes effect on restart,
+**A** means it sits behind the Advanced disclosure on the settings page.
+
+#### Network
+
+| Key | Type | Range | Flags | Setting |
+|---|---|---|---|---|
+| `net.mode` | choice | `wiznet` / `wifi` | R | Interface. `wifi` is absent on parts with no radio. |
+| `net.dhcp` | bool | 0 / 1 | R | Use DHCP. Off means the three fields below are used. |
+| `net.ip` | text |  | R | Static IP |
+| `net.gw` | text |  | R | Gateway |
+| `net.mask` | text |  | R | Netmask |
+| `wifi.ssid` | text |  | R | WiFi SSID. Only used when the interface is WiFi. |
+| `wifi.pass` | password |  | R | WiFi password |
+
+#### System
+
+| Key | Type | Range | Flags | Setting |
+|---|---|---|---|---|
+| `sys.tz` | text |  |  | Timezone. Affects the LED display only. NTP always serves UTC. |
+| `stats.port` | int | `1`..`65535` | R | Management port. This page and /metrics. |
+| `ui.pass` | password |  |  | Management password. Blank leaves this page open to anyone on the network. |
+| `ui.lock` | bool | 0 / 1 |  | Lock settings permanently. One way. Saving this removes the settings page for good; only erasing  |
+
+#### Display
+
+| Key | Type | Range | Flags | Setting |
+|---|---|---|---|---|
+| `disp.en` | bool | 0 / 1 | R | Enable display |
+| `disp.glyph` | bool | 0 / 1 |  | Show presync glyph. Marker shown until the GPS locks. |
+
+#### Service
+
+| Key | Type | Range | Flags | Setting |
+|---|---|---|---|---|
+| `ntp.port` | int | `1`..`65535` | R A | NTP port. 123 is the standard. Clients will not find it anywhere else. |
+| `serve.cal` | int | `-100000`..`100000` | A | Serve calibration (us). Subtracted from t2 and t3. Re-derive before changing. |
+
+#### Display wiring
+
+| Key | Type | Range | Flags | Setting |
+|---|---|---|---|---|
+| `disp.host` | int | `1`..`2` | R A | SPI host. 1 = SPI2, 2 = SPI3. Must differ from the W5500 host. |
+| `disp.cs` | int | `-1`..`33` | R A | CS pin |
+| `disp.mosi` | int | `-1`..`33` | R A | MOSI pin |
+| `disp.sclk` | int | `-1`..`33` | R A | SCLK pin |
+| `disp.hz` | int | `100000`..`20000000` | R A | SPI clock (Hz) |
+| `disp.ndev` | int | `1`..`16` | R A | Cascaded modules |
+
+#### W5500 wiring
+
+| Key | Type | Range | Flags | Setting |
+|---|---|---|---|---|
+| `w5.host` | int | `1`..`2` | R A | SPI host. 1 = SPI2, 2 = SPI3. Must differ from the display host. |
+| `w5.cs` | int | `-1`..`33` | R A | CS pin |
+| `w5.mosi` | int | `-1`..`33` | R A | MOSI pin |
+| `w5.miso` | int | `-1`..`39` | R A | MISO pin |
+| `w5.sclk` | int | `-1`..`33` | R A | SCLK pin |
+| `w5.int` | int | `-1`..`39` | R A | INT pin. Hardware RX timestamping depends on this. |
+| `w5.rst` | int | `-1`..`33` | R A | RST pin |
+| `w5.hz` | int | `1000000`..`20000000` | R A | SPI clock (Hz). 20 MHz is the proven ceiling on GPIO-matrix pins. Reads corrupt silently above it. |
+
+#### GPS wiring
+
+| Key | Type | Range | Flags | Setting |
+|---|---|---|---|---|
+| `gps.uart` | int | `0`..`2` | R A | UART port |
+| `gps.rx` | int | `-1`..`39` | R A | RX pin (GPS TX) |
+| `gps.tx` | int | `-1`..`33` | R A | TX pin |
+| `gps.baud` | int | `1200`..`921600` | R A | Baud rate |
+| `pps.gpio` | int | `-1`..`39` | R A | PPS pin. Hardware-captured by MCPWM. The whole clock rides on this. |
+| `pps.cal` | int | `-1000000`..`1000000` | A | PPS calibration (us) |
+
+`net.mode` is a choice between the W5500 Ethernet path and Wi-Fi STA. `pps.cal` and
+`serve.cal` are microsecond trims: `pps.cal` shifts the PPS reference, `serve.cal` is
+subtracted from both `t2` and `t3` on the way out. Both default to a value measured on the
+reference wiring, so re-derive them if yours differs.
+
+Adding a setting means adding one row to that table. The settings page renders and parses
+itself from it, so there is no second place to update.
 
 ### Build-time defaults
 
