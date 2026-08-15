@@ -30,20 +30,27 @@ static const int64_t kHoldoverMaxUs = 3600LL * 1000000LL; // ...or after 1 hour,
  * Holdover error model.
  *
  * The same argument as kDisciplinedDriftPpm above, carried into holdover: the
- * crystal's ~27ppm offset is COMPENSATED, and the compensation keeps being
- * applied while coasting. What degrades is not that offset but the rate at
- * which the frozen estimate goes stale, which is the frequency drift.
+ * crystal's offset is COMPENSATED, and the compensation keeps being applied
+ * while coasting. What degrades is not that offset but the rate at which the
+ * frozen estimate goes stale, which is the frequency drift. That drift is
+ * thermal, so it depends on your crystal, your enclosure and your room --
+ * statFreqDriftPerSec measures it live rather than assuming a figure.
  *
- * Measured on this hardware over five days: 0.075 ppm/h median, 0.42 ppm/h at
- * p95, dominated by a 1.04 ppm peak-to-peak diurnal cycle that peaks
- * mid-afternoon. statFreqDriftPerSec already measures it live.
+ * Error grows in two terms, not one. The estimate is already wrong by
+ * drift x (the estimator's lag) at the moment GPS is lost, and it keeps going
+ * wrong, which integrates to the quadratic term.
  *
- * Error therefore grows in two terms, not one. The estimate is already wrong by
- * drift x kFreqEstLagSec at the moment GPS is lost (a linear fit over kFitWin
- * lags a ramp by half its window, and the EWMA on top adds ~1/alpha samples),
- * and it keeps going wrong, which integrates to the quadratic term.
+ * The lag is DERIVED in getRootDispersion() from kFitWin and kFreqEwmaAlpha
+ * rather than written down, because a hardcoded figure silently goes wrong the
+ * moment someone retunes either for a different GPS module or a noisier pulse.
+ *
+ * For scale, one deployment (bare board, unheated shed) measured 0.075 ppm/h
+ * median and 0.42 ppm/h at p95, over a 1.04 ppm peak-to-peak daily swing. That
+ * is a wide-swinging environment rather than a gentle one, so treat it as a
+ * rough ceiling for a climate-controlled room and as no guide at all for a
+ * sealed enclosure or an outdoor mount. Nothing here depends on the figure.
  */
-static const double  kFreqEstLagSec = 140.0;              // kFitWin/2 + 1/alpha
+static const double  kFreqEwmaAlpha = 0.05;               // fit -> filtered frequency
 static const double  kHoldoverDriftFloorPpmPerHour = 0.5; // never claim better than this
 
 static uint32_t unix_to_ntp_seconds(time_t unixSec) {
@@ -767,7 +774,7 @@ void GpsDiscipline::handle_pps_deferred() {
         if (filteredFrequencyPpm == 0 && statPpsCount > kFitMinSamples) {
           filteredFrequencyPpm = statFrequencyPpm;
         } else {
-          filteredFrequencyPpm += 0.05 * (statFrequencyPpm - filteredFrequencyPpm);
+          filteredFrequencyPpm += kFreqEwmaAlpha * (statFrequencyPpm - filteredFrequencyPpm);
         }
       }
     }
@@ -973,9 +980,12 @@ double GpsDiscipline::getRootDispersion() const {
    * six minutes of a holdover budgeted for an hour, while its real error at
    * that point was about 2us.
    */
+  // A linear fit over kFitWin lags a ramp by half its window; the EWMA on top
+  // adds ~1/alpha samples. Derived here so retuning either stays consistent.
+  const double lagSec = kFitWin / 2.0 + 1.0 / kFreqEwmaAlpha;
   double driftPpmPerSec = fmax(fabs(statFreqDriftPerSec) * 1e6,
                                kHoldoverDriftFloorPpmPerHour / 3600.0);
-  double freqErrPpm = driftPpmPerSec * kFreqEstLagSec;
+  double freqErrPpm = driftPpmPerSec * lagSec;
   double growSec = freqErrPpm * 1e-6 * sinceGoodSec
                  + 0.5 * driftPpmPerSec * 1e-6 * sinceGoodSec * sinceGoodSec;
   return fabs(filteredRmsOffsetSec) + growSec + 16e-6;
