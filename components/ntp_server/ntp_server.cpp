@@ -127,6 +127,7 @@ static double s_turnTicks = 0.0;
 static bool s_turnSeeded = false;
 static uint32_t s_turnSamples = 0;
 static uint32_t s_lateStampOk = 0;
+static uint32_t s_interleavedServed = 0;   /* replies carrying a measured t3 */
 static uint32_t s_lateStampFallbacks = 0;
 /* Last nonzero rc from w5k_send_stage: -1 = TX free-space check, -2 = the
  * Sn_TX_WR advance did not equal the frame length. */
@@ -263,6 +264,7 @@ uint32_t NtpServer::getPrimeSkips() const { return s_primeSkips; }
 uint32_t NtpServer::getCapRejects() const { return s_capRejects; }
 uint32_t NtpServer::getRxIrqCount() const { return s_rxIrqCount; }
 uint32_t NtpServer::getLateStampOk() const { return s_lateStampOk; }
+uint32_t NtpServer::getInterleavedServed() const { return s_interleavedServed; }
 uint32_t NtpServer::getLateStampFallbacks() const { return s_lateStampFallbacks; }
 int NtpServer::getLastStageRc() const { return s_lastStageRc; }
 int NtpServer::getLastWrDelta() const { return s_lastWrDelta; }
@@ -558,6 +560,27 @@ void IRAM_ATTR NtpServer::loop() {
   /* Marks a bucket whose peer we have already ARP-resolved, so an over-budget
    * reply can be sent without paying for resolution. */
   static bool bucketWarm[64];
+  /*
+   * Interleaved mode state (RFC 9769), reusing the same client buckets.
+   *
+   * bucketIlRx  is the receive timestamp we put in that peer's last response;
+   *             a client asks for interleaved by echoing it back as its origin.
+   * bucketIlTx  is the MEASURED transmit time of that last response, which is
+   *             the whole point: it can only be known after the packet is gone,
+   *             so it is reported in the NEXT response rather than this one.
+   *
+   * A hash collision between two clients is harmless by construction. The
+   * origin has to match bucketIlRx exactly, and another client's timestamp will
+   * not, so a collision degrades to basic mode instead of ever handing out a
+   * timestamp belonging to a different exchange.
+   *
+   * Both are kept as the raw eight wire bytes rather than decoded fields: the
+   * comparison against the client's origin is then a memcmp of exactly what was
+   * sent, with no chance of a decode/encode round trip changing a bit.
+   */
+  static uint8_t bucketIlRx[64][8];
+  static uint8_t bucketIlTx[64][8];
+  static bool bucketIlValid[64];
   static bool bucketInit = false;
   if (!bucketInit) {
     /* A zero-initialised bucketSec collides with a legitimate currentSec of 0,
@@ -574,6 +597,22 @@ void IRAM_ATTR NtpServer::loop() {
     bucketCount[b] = 0;
   }
   bucketCount[b]++;
+
+  /*
+   * Decide the response mode (RFC 9769 client/server interleaved).
+   *
+   * "A client request in the interleaved mode has an origin timestamp equal to
+   * the receive timestamp from the last valid server response", and the server
+   * "MUST NOT respond in the interleaved mode unless ... the request does not
+   * have a receive timestamp equal to the transmit timestamp" and the origin
+   * matches a saved receive timestamp.
+   *
+   * Answering interleaved is invisible to everyone else: a basic client never
+   * sends a matching origin, so it always takes the branch below unchanged.
+   */
+  bool interleaved = bucketIlValid[b] &&
+                     memcmp(&req[32], &req[40], 8) != 0 &&
+                     memcmp(&req[24], bucketIlRx[b], 8) == 0;
   // Also keep a global ceiling so a distributed flood still can't monopolise
   // the single core; well above any legitimate aggregate.
   if (currentSec != windowSec) {
@@ -582,6 +621,18 @@ void IRAM_ATTR NtpServer::loop() {
   }
   windowCount++;
   bool overBudget = (bucketCount[b] > 20 || windowCount > 200);
+  /* A Kiss-o'-Death is answered in basic mode whatever was asked. It carries no
+   * usable timestamps anyway, and the rewritten origin below has to stay the
+   * one the client will recognise or it discards the KoD as spoofed and never
+   * backs off -- which would defeat the rate limiting entirely. */
+  if (overBudget) interleaved = false;
+  if (interleaved) {
+    /* "A server response in the interleaved mode has an origin timestamp equal
+     * to the receive timestamp from the client request" -- which is also how
+     * the client tells the two modes apart, so it must replace the basic-mode
+     * origin written earlier. */
+    memcpy(&rsp[24], &req[32], 8);
+  }
   if (overBudget) {
     /*
      * Kiss-o'-Death. LI MUST be 3 (unsynchronised) *together with* stratum 0:
@@ -714,10 +765,25 @@ void IRAM_ATTR NtpServer::loop() {
      * both the stamp and the measurement on the same instant.
      */
     txStart = esp_timer_get_time();
-    computeNtpTimestamp(txStart + (uint64_t)(s_txCorrectionUs + 0.5),
-                        locked, t3_sec, t3_frac);
-    ntp_ts_sub_us(t3_sec, t3_frac, Config::getServeCalibrationUs());
-    wr_ntp_ts(tail, 0, t3_sec, t3_frac);
+    if (interleaved) {
+      /*
+       * Interleaved: report the transmit time actually MEASURED for the
+       * previous response instead of predicting this one's. That replaces
+       * s_txCorrectionUs -- an EWMA over a send path whose span runs from 170us
+       * to tens of milliseconds -- with a number that was observed rather than
+       * modelled, so the per-packet variation of the send path stops landing in
+       * the client's offset.
+       *
+       * The prediction is still computed below for the chain update, because
+       * the next interleaved response needs THIS packet's measurement.
+       */
+      memcpy(tail, bucketIlTx[b], 8);
+    } else {
+      computeNtpTimestamp(txStart + (uint64_t)(s_txCorrectionUs + 0.5),
+                          locked, t3_sec, t3_frac);
+      ntp_ts_sub_us(t3_sec, t3_frac, Config::getServeCalibrationUs());
+      wr_ntp_ts(tail, 0, t3_sec, t3_frac);
+    }
     uint32_t capBefore = 0, capTmp = 0;
     if (gps) gps->getRxCapture(capTmp, capBefore);
     cG = esp_cpu_get_cycle_count();
@@ -758,9 +824,13 @@ void IRAM_ATTR NtpServer::loop() {
   if (!late) {
     /* Fallback: stamp t3 then hand the whole frame to the blocking send. */
     s_lateStampFallbacks++;
-    computeNtpTimestamp(esp_timer_get_time() + (uint64_t)(s_txCorrectionUs + 0.5),
-                        locked, t3_sec, t3_frac);
-    wr_ntp_ts(rsp, 40, t3_sec, t3_frac);
+    if (interleaved) {
+      memcpy(&rsp[40], bucketIlTx[b], 8);
+    } else {
+      computeNtpTimestamp(esp_timer_get_time() + (uint64_t)(s_txCorrectionUs + 0.5),
+                          locked, t3_sec, t3_frac);
+      wr_ntp_ts(rsp, 40, t3_sec, t3_frac);
+    }
     txStart = esp_timer_get_time();
     sret = w5k_sendto((uint8_t)sock, rsp, sizeof(rsp), from_ip, from_port);
     txEnd = esp_timer_get_time();
@@ -778,6 +848,38 @@ void IRAM_ATTR NtpServer::loop() {
   }
   if (sret == (int32_t)sizeof(rsp)) {
     requestCount++;
+    /*
+     * Advance this peer's interleaved chain.
+     *
+     * txEnd is read the instant SEND is accepted, so it is a per-packet
+     * MEASUREMENT of when this reply left rather than a prediction. It is not a
+     * wire-egress capture: deriving t3 from the SENDOK capture was tried and
+     * reverted (see the note above) because INTn is level-asserted and shared
+     * with RECV, so an edge cannot be attributed to a specific packet. What
+     * remains between here and the wire is the W5500's own fixed store-and-
+     * forward latency, which is roughly constant and absorbed by the serve
+     * calibration -- unlike the send-path variation, which is not.
+     *
+     * So interleaved mode removes the prediction error here, not the
+     * timestamping error. That is a real improvement and it is also the honest
+     * limit of it.
+     *
+     * The same calibration that t2 and a predicted t3 carry is applied, so a
+     * client differencing them is comparing like with like.
+     */
+    if (!overBudget) {
+      uint32_t mSec, mFrac;
+      computeNtpTimestamp(txEnd, locked, mSec, mFrac);
+      ntp_ts_sub_us(mSec, mFrac, Config::getServeCalibrationUs());
+      /* RFC 9769: a server "MUST NOT send a packet that has a transmit
+       * timestamp equal to the receive timestamp", or the client cannot tell
+       * the modes apart. Nudge the low bit rather than drop the sample. */
+      if (mSec == t2_sec && mFrac == t2_frac) mFrac ^= 1u;
+      wr_ntp_ts(bucketIlTx[b], 0, mSec, mFrac);
+      if (interleaved) s_interleavedServed++;
+      memcpy(bucketIlRx[b], &rsp[32], 8);   // exactly what we told the client
+      bucketIlValid[b] = true;
+    }
     // EWMA of actual send duration → next packet's t3 pre-correction.
     double txDur = (double)(txEnd - txStart);
     if (!s_txCorrectionSeeded) {

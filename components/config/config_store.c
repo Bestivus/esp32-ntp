@@ -124,9 +124,9 @@ const cfg_field_t g_cfg_fields[CFG_COUNT] = {
                        .sdef="", .help="Blank leaves this page open to anyone on the network." },
   [CFG_UI_LOCK]    = { .key="ui.lock", .label="Lock settings permanently", .group="System", .type=CF_BOOL,
                        .imin=0, .imax=1, .idef=0,
-                       .help="One way. Saving this removes the settings page for good; only erasing "
-                             "the NVS partition over USB brings it back. Metrics keep working. "
-                             "Requires a password to be set." },
+                       .help="One way. Removes the settings page for good; only erasing NVS over "
+                             "USB brings it back. Metrics keep working. Needs a password set "
+                             "first, which only stops you doing this by accident." },
 
   [CFG_DISP_EN]    = { .key="disp.en", .label="Enable display", .group="Display", .type=CF_BOOL,
                        .imin=0, .imax=1, .idef=DEF_DISP_EN, .reboot=true },
@@ -139,7 +139,7 @@ const cfg_field_t g_cfg_fields[CFG_COUNT] = {
                        .help="123 is the standard. Clients will not find it anywhere else.",
                        .reboot=true, .advanced=true },
   [CFG_SERVE_CAL]  = { .key="serve.cal", .label="Serve calibration (us)", .group="Service", .type=CF_INT,
-                       .imin=-100000, .imax=100000, .idef=7,
+                       .imin=-100000, .imax=100000, .idef=-4,
                        .help="Subtracted from t2 and t3. Re-derive before changing.",
                        .advanced=true },
 
