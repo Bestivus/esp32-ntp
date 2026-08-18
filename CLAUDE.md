@@ -15,15 +15,18 @@ new NVS-backed settings/management UI, and independently landed several fixes th
 work described below (their own SOCK_BUSY yield fix, their own 240MHz/80MHz sdkconfig). As a
 result, most of Parts 2, 3, 5, and 6 below describe root causes and fixes for code that no longer
 exists in this form — kept as history (the debugging process and root causes were real), but not
-as an accurate map of the current source. The MQTT component (Part 6) is being re-ported onto the
-new driver separately; it is not present on this branch yet. The three merged PRs referenced
-throughout (build fixes, two bug fixes, enclosure) remain accurate — that work is now part of
-upstream's own history.
+as an accurate map of the current source. The three merged PRs referenced throughout (build fixes,
+two bug fixes, enclosure) remain accurate — that work is now part of upstream's own history. **See
+Part 7** for what actually happened on top of that rebase: the MQTT re-port, the config-hygiene
+fixes from a real PR review, and folding in upstream's subsequent commits.
 
-**Current status: working.** GPS-locked, Stratum 1, sub-microsecond internal precision (7ns PPS
-jitter, matching/beating the maintainer's own published benchmarks), 12+ hours of clean uptime
-with zero watchdog resets, zero W5500 chip resets, zero PPS rejects. MQTT status publishing to
-Home Assistant (Part 6) also confirmed working end-to-end against a real EMQX broker.
+**Current status: working, and this is now the fork's primary branch.** GPS-locked, Stratum 1,
+sub-microsecond internal precision (10ns PPS jitter), zero PPS rejects, zero W5500 chip resets,
+zero DHCP errors across a multi-day soak that included a power cycle. Offset/RMS-offset/frequency
+drift settle to a few tens of ns after enough continuous runtime (observed: -62ns offset, 50ns RMS,
+-0.02 ppm/hr drift after ~16.5 hours uninterrupted) — see Part 7 for the settling-time
+investigation and what's still open there. MQTT status publishing to Home Assistant confirmed
+working end-to-end against a real EMQX broker.
 
 ---
 
@@ -304,7 +307,82 @@ rather than waiting on it. **If/when #183 merges upstream**, `.gitmodules` can b
 
 ---
 
-## Files modified from upstream, complete list
+## Part 7: Rebasing onto upstream's rewrite, and what came with it
+
+Parts 1–6 above are the record of getting the *pre-rewrite* fork working. This part covers what
+happened after deciding to rebase onto upstream's own subsequent rewrite instead of continuing to
+carry the fork's own patches forward — the reasoning, in order.
+
+**Why rebase at all.** The original watchdog-crash investigation (Part 3) surfaced a real tension:
+this fork's own bandaid fixes (the bounded SPI timeout, in particular) touch code the maintainer's
+own comments mark as accuracy-critical, trading a loud failure mode (a crash) for a theoretically
+possible quiet one (a corrupted timestamp), with no telemetry either way. Around the same time,
+upstream had independently done a substantial rewrite — a first-party `w5500_drv` replacing the
+vendored `ioLibrary_Driver`, and an NVS-backed settings system. Testing confirmed upstream's own
+code already worked cleanly at both 160MHz and 240MHz, which meant the cleanest path forward wasn't
+more patches — it was moving onto code that had already made the old patches unnecessary.
+
+**Dropping the forked `ioLibrary_Driver` submodule entirely.** This fork's `Wiznet/ioLibrary_Driver`
+fork existed for exactly one reason: `socket.c`'s `recv()` checked non-blocking-mode before checking
+data-availability, so a non-blocking TCP socket could never actually read anything (Part 6, Bug 4).
+Upstream's new `w5500_drv` doesn't share that codebase at all, and doesn't have the bug — so the
+submodule, the fork, and the patch all went away together. No functional loss; the one thing that
+submodule was for is now upstream's problem to not have.
+
+**MQTT re-implemented from scratch, not ported.** The original MQTT implementation (Part 6) reused
+Paho MQTT-C's wire-format codec functions, vendored out of the very `ioLibrary_Driver` checkout
+being dropped. Rather than re-vendor more of a dependency already being removed, MQTT was rewritten
+as a hand-rolled, zero-dependency MQTT 3.1.1 wire codec (`components/mqtt_publish/mqtt_wire.h/.c`).
+Same design constraints as before and non-negotiable for the same reason: a non-blocking,
+tick-driven state machine polled from the NTP task's housekeeping slot, at most one socket call per
+tick, never blocking — so nothing here can ever delay a PPS capture or an NTP reply. Verified
+working end-to-end against a real EMQX broker: TCP connect, CONNECT/CONNACK, all 14 Home Assistant
+discovery entities populating correctly.
+
+**A real PR review turned up real problems.** JR's review on an actual submitted PR flagged: a
+fully regenerated `sdkconfig` snapshot had been committed, carrying this machine's static IP, NTP
+server, and timezone into the repo; the build was using `CONFIG_COMPILER_OPTIMIZATION_DEBUG`
+(`-Og`) instead of `-O2`, which measurably changes ISR/SPI timing on a microsecond-precision server;
+and `CONFIG_ESP_TASK_WDT_PANIC` was off, defeating a deliberate self-healing mechanism (a watchdog
+timeout is supposed to panic and reboot, not just log and keep running degraded). Resolved by:
+`sdkconfig` stopped being tracked on this branch entirely (matching `main`'s existing
+`fe5efe2`), and a curated `sdkconfig.defaults` added instead — five lines, each individually
+justified in its own comment, deliberately *not* a full config dump. Confirmed via
+`idf.py save-defconfig` that CPU frequency, flash frequency, partition table, IRAM placement, and
+libc choice all already resolve correctly from this codebase's own Kconfig tree without needing to
+be listed — they only looked like a gap in one comparison because that comparison was against this
+fork's older, pre-rewrite `main`, which had drifted (separately, and is being retired rather than
+fixed — see `PLANS.local.md`).
+
+**The multi-hour settling-time question.** After a reset, `ntp_clock_offset_seconds` (the fit's
+live per-pulse residual, not a served-clock error — see the comment at `gps.cpp` around the
+`offset` assignment) took several hours to settle to its steady-state floor, non-monotonically. This
+was checked against the model's actual memory: the frequency fit is a hard 240-second sliding
+window (`kFitWin`), the drift-rate lag is 60 pulses, and the RMS filters have `alpha` around 0.05–
+0.1 — nothing in the software has a memory anywhere near multi-hour scale. Combined with the
+maintainer's own comment that a linear fit's endpoint residual under a real frequency ramp is
+`a*T²/12`, the conclusion is that this is genuine, if slower-than-expected, crystal frequency drift
+after a reset — not a software convergence artifact. A fresh flash isn't a power cycle (`esptool`'s
+hard-reset only toggles EN), so it isn't ambient cold-start warmup either; the working theory is a
+change in on-die/board self-heating pattern around the reset event, not yet confirmed. A same-build
+reset on the fork's old `main` showed the identical shape, which rules out this being specific to
+the new driver or the new MQTT port. What's **not yet resolved**: whether MQTT's extra SPI/CPU
+activity specifically lengthens the settling time versus a bare build — no-MQTT A/B test is still
+outstanding, tracked in `PLANS.local.md`. Observed steady state after ~16.5 hours of uninterrupted
+runtime (MQTT enabled): -62ns offset, 50ns RMS, -0.02 ppm/hr drift, essentially at the noise floor.
+
+**Folded in upstream's subsequent commits before promoting this branch**: NTP interleaved mode
+(RFC 9769 — clients that ask for it get a measured transmit timestamp instead of a predicted one),
+the serve calibration defaulting to the measured value, the estimator lag now derived instead of
+hardcoded, and holdover dispersion growing at the drift rate instead of the compensated offset.
+Merged clean, no conflicts outside `README.md`, build verified.
+
+---
+
+## Files modified from upstream (Parts 1–6, historical — describes the pre-rewrite fork)
+
+None of this reflects the current source; upstream's own rewrite superseded all of it (see Part 7).
+Kept for the historical record only.
 
 - `CMakeLists.txt` (top-level) — missing-field-initializer warning suppression
 - `components/w5500_eth/CMakeLists.txt` — added `esp_driver_gpio` requirement; added scoped
@@ -327,3 +405,18 @@ rather than waiting on it. **If/when #183 merges upstream**, `.gitmodules` can b
 - `main/Kconfig.projbuild`, `components/config/config.h`/`.cpp` — new `APP_MQTT_*` options and
   accessors (Part 6)
 - `components/mqtt_publish/` — new component, not an upstream file (Part 6)
+
+## Files modified from upstream on this branch, current
+
+- `components/w5500_eth/w5500_drv.c`/`.h` — added `w5500_tcp_connect()`, a client-mode counterpart
+  to the existing listen-mode socket support, with a varying ephemeral source port per call
+- `components/w5k/w5k_tcp_wrapper.c`/`.h` — thin wrappers over the above
+  (`w5k_tcp_connect()`/`w5k_tcp_close()`)
+- `main/Kconfig.projbuild`, `components/config/config.h`/`.cpp` — `APP_MQTT_*` options and
+  accessors; Kconfig-time only, deliberately not wired into the NVS-backed settings store
+- `main/app_main.cpp`, `main/CMakeLists.txt` — wire up `MqttPublisher`
+- `components/mqtt_publish/` — new component, not an upstream file
+- `sdkconfig.defaults` — new file, not upstream's convention (upstream commits a full `sdkconfig`
+  directly); see Part 7 for why this fork does it differently
+- `README.md` — fork-specific header section only; everything below it is upstream's own current
+  content
